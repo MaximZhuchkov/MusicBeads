@@ -1,0 +1,25 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Страница-1" id="PVrv7jBqZ0zm2r6nVzfd">
+    <mxGraphModel dx="1414" dy="788" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="e20qh9E81S4WoS0ovEL9-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="Музыкальные бусы" vertex="1">
+          <mxGeometry height="30" width="190" x="300" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="e20qh9E81S4WoS0ovEL9-2" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="MusicBeads" vertex="1">
+          <mxGeometry height="160" width="140" x="260" y="175" as="geometry" />
+        </mxCell>
+        <mxCell id="e20qh9E81S4WoS0ovEL9-3" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;" value="БД текстов" vertex="1">
+          <mxGeometry height="130" width="110" x="580" y="190" as="geometry" />
+        </mxCell>
+        <mxCell id="e20qh9E81S4WoS0ovEL9-4" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" value="Actor" vertex="1">
+          <mxGeometry height="60" width="30" x="50" y="220" as="geometry" />
+        </mxCell>
+        <mxCell id="e20qh9E81S4WoS0ovEL9-5" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Telegram" vertex="1">
+          <mxGeometry height="160" width="140" x="270" y="440" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
