@@ -19,6 +19,18 @@ Flow:
      by one of that round's participants) immediately ends it and notifies both
      the group and every participant who had a part.
 
+Admin tools (group administrators/creator only) for dealing with inactive
+registrants who'd otherwise leave a song perpetually incomplete:
+  - /snooze: temporarily excludes a registered user from this group's rounds
+    for a given duration (minutes/hours/days). They stay registered and
+    rejoin automatically once the snooze expires -- no need to /register again.
+  - /unsnooze: lifts a snooze early.
+  - /unregister_user: completely removes another user's registration for this
+    group. To participate again, they must /register themselves.
+  All three target a user either by replying to one of their messages (most
+  reliable) or with `@username`/a numeric id, resolved among users already
+  registered in that group.
+
 Song selection avoids repeats: each group won't be given the same song twice in
 a row across separate /playsong runs until every song in songs/ has come up for
 that group, at which point the rotation for that group resets. This tracking is
@@ -49,9 +61,14 @@ Known v1 simplifications (see chat for discussion):
   - /playsong and /cancel are restricted to group administrators/creator
     (checked live via getChatMember at command time -- not cached, so a
     demotion/promotion takes effect on the very next command). /register and
-    /unregister remain open to everyone.
+    /unregister remain open to everyone. /snooze, /unsnooze, and
+    /unregister_user are likewise admin-only.
   - Per-group "already played" song tracking is in-memory only (see module
     docstring above); it is deliberately NOT persisted to the DB.
+  - @username resolution for /snooze, /unsnooze, and /unregister_user only
+    works for users already registered in that group -- Telegram's Bot API
+    has no general username-to-id lookup. Replying to the target's message
+    always works regardless of this.
 """
 
 import asyncio
@@ -59,7 +76,9 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -90,19 +109,22 @@ SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
 ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
-PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.5))
+PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
 
 # ---------------------------------------------------------------------------
-# Persistence (SQLite-backed registrations)
+# Persistence (SQLite-backed registrations and snoozes)
 # ---------------------------------------------------------------------------
 #
 # A registration is a (group_chat_id, user_id) pair -- a user can be registered
 # in several groups at once, and each group has its own independent roster.
-# Everything else (rounds, assignments, submissions) stays in-memory as before.
+# A snooze is also (group_chat_id, user_id)-scoped: it temporarily excludes an
+# otherwise-registered user from that group's rounds without unregistering
+# them, and expires on its own once `until_ts` passes. Everything else
+# (rounds, assignments, submissions) stays in-memory as before.
 
 
 def init_db() -> None:
-    """Create the registrations table if it doesn't exist yet. Safe to call every startup."""
+    """Create tables if they don't exist yet. Safe to call every startup."""
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute(
             """
@@ -110,6 +132,17 @@ def init_db() -> None:
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 display_name TEXT NOT NULL,
+                username TEXT,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snoozes (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                until_ts INTEGER NOT NULL,
                 PRIMARY KEY (chat_id, user_id)
             )
             """
@@ -117,34 +150,70 @@ def init_db() -> None:
         conn.commit()
 
 
-def load_registrations() -> dict[int, dict[int, str]]:
+def load_registrations() -> dict[int, dict[int, dict]]:
     """Load all persisted registrations into the in-memory shape used at runtime:
-    chat_id -> {user_id: display_name}.
+    chat_id -> {user_id: {"name": display_name, "username": username_or_None}}.
     """
-    result: dict[int, dict[int, str]] = {}
+    result: dict[int, dict[int, dict]] = {}
     with sqlite3.connect(DB_FILE) as conn:
-        for chat_id, user_id, display_name in conn.execute(
-            "SELECT chat_id, user_id, display_name FROM registrations"
+        for chat_id, user_id, display_name, username in conn.execute(
+            "SELECT chat_id, user_id, display_name, username FROM registrations"
         ):
-            result.setdefault(chat_id, {})[user_id] = display_name
+            result.setdefault(chat_id, {})[user_id] = {"name": display_name, "username": username}
     return result
 
 
-def db_add_registration(chat_id: int, user_id: int, display_name: str) -> None:
+def db_add_registration(chat_id: int, user_id: int, display_name: str, username: Optional[str]) -> None:
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute(
-            "INSERT INTO registrations (chat_id, user_id, display_name) VALUES (?, ?, ?) "
-            "ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name = excluded.display_name",
-            (chat_id, user_id, display_name),
+            "INSERT INTO registrations (chat_id, user_id, display_name, username) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (chat_id, user_id) DO UPDATE SET "
+            "display_name = excluded.display_name, username = excluded.username",
+            (chat_id, user_id, display_name, username),
         )
         conn.commit()
 
 
 def db_remove_registration(chat_id: int, user_id: int) -> bool:
-    """Returns True if a row was actually deleted (i.e. the user was registered)."""
+    """Deletes the registration (and any snooze for the same pair, since a
+    snooze on someone who's no longer registered is meaningless). Returns True
+    if a registration row actually existed.
+    """
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.execute(
             "DELETE FROM registrations WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+        conn.execute("DELETE FROM snoozes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def load_snoozes() -> dict[int, dict[int, int]]:
+    """Load all persisted snoozes into chat_id -> {user_id: until_ts (unix seconds, UTC)}."""
+    result: dict[int, dict[int, int]] = {}
+    with sqlite3.connect(DB_FILE) as conn:
+        for chat_id, user_id, until_ts in conn.execute(
+            "SELECT chat_id, user_id, until_ts FROM snoozes"
+        ):
+            result.setdefault(chat_id, {})[user_id] = until_ts
+    return result
+
+
+def db_set_snooze(chat_id: int, user_id: int, until_ts: int) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO snoozes (chat_id, user_id, until_ts) VALUES (?, ?, ?) "
+            "ON CONFLICT (chat_id, user_id) DO UPDATE SET until_ts = excluded.until_ts",
+            (chat_id, user_id, until_ts),
+        )
+        conn.commit()
+
+
+def db_clear_snooze(chat_id: int, user_id: int) -> bool:
+    """Returns True if a snooze row actually existed."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.execute(
+            "DELETE FROM snoozes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
         )
         conn.commit()
         return cur.rowcount > 0
@@ -154,10 +223,16 @@ def db_remove_registration(chat_id: int, user_id: int) -> bool:
 # In-memory state
 # ---------------------------------------------------------------------------
 
-# chat_id -> {user_id: display_name}. Mirrors the `registrations` DB table and is
-# populated from it at startup by load_registrations(); every mutation below also
-# writes through to the DB so the two stay in sync.
-registered_users: dict[int, dict[int, str]] = {}
+# chat_id -> {user_id: {"name": display_name, "username": username_or_None}}.
+# Mirrors the `registrations` DB table and is populated from it at startup by
+# load_registrations(); every mutation below also writes through to the DB so
+# the two stay in sync.
+registered_users: dict[int, dict[int, dict]] = {}
+
+# chat_id -> {user_id: until_ts (unix seconds, UTC)}. Mirrors the `snoozes` DB
+# table the same way. A snoozed-but-still-registered user is skipped when
+# assigning parts for a round until their snooze expires.
+snoozed_until: dict[int, dict[int, int]] = {}
 
 # chat_id -> set of song filenames already picked for that group. Intentionally
 # NOT persisted -- starts empty every time the bot restarts (see module docstring).
@@ -190,6 +265,73 @@ class Round:
 
 
 current_round: Optional[Round] = None
+
+
+def is_snoozed(chat_id: int, user_id: int) -> bool:
+    """Whether the user is currently snoozed in this group. Lazily cleans up
+    expired snoozes (memory + DB) as a side effect, so callers don't need to
+    worry about stale entries lingering after the deadline passes.
+    """
+    until_ts = snoozed_until.get(chat_id, {}).get(user_id)
+    if until_ts is None:
+        return False
+    if until_ts > int(datetime.now(timezone.utc).timestamp()):
+        return True
+    snoozed_until.get(chat_id, {}).pop(user_id, None)
+    db_clear_snooze(chat_id, user_id)
+    return False
+
+
+def active_participant_ids(chat_id: int) -> list[int]:
+    """Registered users for this group, excluding anyone currently snoozed."""
+    return [
+        uid for uid in registered_users.get(chat_id, {})
+        if not is_snoozed(chat_id, uid)
+    ]
+
+
+DURATION_RE = re.compile(
+    r"^(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$", re.IGNORECASE
+)
+
+
+def parse_duration(text: str) -> Optional[timedelta]:
+    """Parses a duration like '30m', '2h', '3 days' into a timedelta. Returns
+    None if the text doesn't match one of the supported minute/hour/day forms.
+    """
+    match = DURATION_RE.match(text.strip())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("m"):
+        return timedelta(minutes=amount)
+    if unit.startswith("h"):
+        return timedelta(hours=amount)
+    return timedelta(days=amount)
+
+
+def resolve_registered_user(chat_id: int, ref: str) -> Optional[int]:
+    """Resolves a command-argument user reference (`@username` or a raw numeric
+    user id) to a user_id, but only among users already registered in this
+    group. Telegram's Bot API has no general way to look up an arbitrary user
+    by @username, so this only works for users already on file for this group
+    from a prior /register -- replying to the target's own message (which
+    carries the full User object) is the reliable alternative and doesn't
+    have this limitation.
+    """
+    ref = ref.strip()
+    group = registered_users.get(chat_id, {})
+    if ref.startswith("@"):
+        username = ref[1:].lower()
+        for uid, info in group.items():
+            if info.get("username") and info["username"].lower() == username:
+                return uid
+        return None
+    if ref.lstrip("-").isdigit():
+        uid = int(ref)
+        return uid if uid in group else None
+    return None
 
 # ---------------------------------------------------------------------------
 # Network resilience
@@ -397,8 +539,8 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     display_name = user.first_name or user.username or str(user.id)
 
-    db_add_registration(chat_id, user.id, display_name)
-    registered_users.setdefault(chat_id, {})[user.id] = display_name
+    db_add_registration(chat_id, user.id, display_name, user.username)
+    registered_users.setdefault(chat_id, {})[user.id] = {"name": display_name, "username": user.username}
 
     await call_with_retry(
         lambda: update.message.reply_text(
@@ -445,6 +587,7 @@ async def unregister_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     was_registered = db_remove_registration(chat_id, user.id)
     registered_users.get(chat_id, {}).pop(user.id, None)
+    snoozed_until.get(chat_id, {}).pop(user.id, None)
 
     if was_registered:
         text = "Вы отменили регистрацию на исполнение песен в этой группе."
@@ -510,6 +653,17 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    participant_ids = active_participant_ids(chat_id)
+    if not participant_ids:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Все зарегистрированные участники этой группы сейчас в snooze. "
+                "Проверьте /snooze или дождитесь его окончания."
+            ),
+            description="playsong: all snoozed reply",
+        )
+        return
+
     song, filename, exhausted = load_random_song(exclude=played_songs.get(chat_id))
     if exhausted:
         # Every song has already been played for this group -- start a fresh
@@ -518,7 +672,6 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Song rotation for chat %s exhausted; resetting.", chat_id)
     played_songs.setdefault(chat_id, set()).add(filename)
 
-    participant_ids = list(group_registrations.keys())
     assignments = assign_parts(song, participant_ids)
 
     r = Round(song, filename, update.effective_chat.id, participant_ids)
@@ -536,7 +689,7 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"У вас есть {ROUND_DURATION_SECONDS // 60} минут."
     )
     if r.perk:
-        announcement += f"\n\n\U0001F3B2 Задание: <b>{r.perk}</b>"
+        announcement += f"\n\n\U0001F3B2 Модификатор: <b>{r.perk}</b>"
     await call_with_retry(
         lambda: update.message.reply_text(announcement, parse_mode=ParseMode.HTML),
         description="playsong: round start announcement",
@@ -754,6 +907,262 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_round = None
 
 
+def _extract_target(update: Update, args: list[str]) -> tuple[Optional[int], Optional[str]]:
+    """Shared target-resolution for the admin commands below. Returns
+    (target_user_id, remaining_args_error) where the second value, if not
+    None, is a ready-to-send Russian error message explaining why no target
+    could be resolved (missing/bad reference) -- args itself is NOT consumed
+    here since duration parsing differs between /snooze and /unregister_user.
+    Prefers replying to the target's own message (always works); falls back
+    to the first arg being '@username' or a numeric id among users already
+    registered in this group.
+    """
+    chat_id = update.effective_chat.id
+    reply_to = update.message.reply_to_message
+    if reply_to is not None and reply_to.from_user is not None:
+        return reply_to.from_user.id, None
+    if not args:
+        return None, None
+    target_id = resolve_registered_user(chat_id, args[0])
+    if target_id is None:
+        return None, (
+            f"Не нашёл среди зарегистрированных в этой группе пользователя {args[0]}. "
+            "Либо ответьте этой командой на сообщение нужного участника."
+        )
+    return target_id, None
+
+
+async def snooze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only. Temporarily excludes a still-registered user from this
+    group's rounds for a given duration (they keep their registration and
+    don't need to /register again once it expires). Usage:
+      Reply to their message:  /snooze 2h
+      Or by reference:         /snooze @username 2h   /snooze 123456789 30m
+    Duration units: m/min/minutes, h/hour/hours, d/day/days.
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /snooze в групповом чате."),
+            description="snooze_command: wrong chat type reply",
+        )
+        return
+
+    if not await is_group_admin(context, chat.id, update.effective_user.id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использовать /snooze могут только администраторы или создатель группы."
+            ),
+            description="snooze_command: not admin reply",
+        )
+        return
+
+    chat_id = chat.id
+    args = context.args or []
+    reply_to = update.message.reply_to_message
+
+    if reply_to is not None and reply_to.from_user is not None:
+        if len(args) != 1:
+            await call_with_retry(
+                lambda: update.message.reply_text(
+                    "Ответьте на сообщение участника и укажите длительность, например: /snooze 2h"
+                ),
+                description="snooze_command: usage (reply form) reply",
+            )
+            return
+        target_id, error = reply_to.from_user.id, None
+        duration_text = args[0]
+    else:
+        if len(args) != 2:
+            await call_with_retry(
+                lambda: update.message.reply_text(
+                    "Использование: /snooze @username 2h\n"
+                    "(или ответьте на сообщение участника командой /snooze 2h)\n"
+                    "Единицы: m/min (минуты), h/hour (часы), d/day (дни)."
+                ),
+                description="snooze_command: usage reply",
+            )
+            return
+        target_id, error = _extract_target(update, args[:1])
+        duration_text = args[1]
+
+    if error:
+        await call_with_retry(lambda: update.message.reply_text(error), description="snooze_command: target not found reply")
+        return
+
+    if target_id not in registered_users.get(chat_id, {}):
+        await call_with_retry(
+            lambda: update.message.reply_text("Этот пользователь не зарегистрирован в этой группе."),
+            description="snooze_command: not registered reply",
+        )
+        return
+
+    duration = parse_duration(duration_text)
+    if duration is None:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                f"Не понимаю длительность «{duration_text}». Примеры: 30m, 2h, 3d."
+            ),
+            description="snooze_command: bad duration reply",
+        )
+        return
+
+    until = datetime.now(timezone.utc) + duration
+    until_ts = int(until.timestamp())
+    snoozed_until.setdefault(chat_id, {})[target_id] = until_ts
+    db_set_snooze(chat_id, target_id, until_ts)
+
+    target_name = registered_users[chat_id][target_id]["name"]
+    until_str = until.strftime("%d.%m.%Y %H:%M UTC")
+
+    await call_with_retry(
+        lambda: update.message.reply_text(
+            f"\U0001F634 {target_name} не будет участвовать в раундах этой группы до {until_str}."
+        ),
+        description="snooze_command: confirmation reply",
+    )
+    await call_with_retry(
+        lambda: context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"Администратор группы «{chat.title}» приостановил ваше участие в "
+                f"исполнении песен до {until_str}. Регистрация сохраняется — участие "
+                "возобновится автоматически."
+            ),
+        ),
+        description=f"snooze_command: DM to {target_id}",
+        attempts=1,
+    )
+
+    logger.info(
+        "User %s snoozed in chat %s until %s (%s) by admin %s",
+        target_id, chat_id, until_str, duration_text, update.effective_user.id,
+    )
+
+
+async def unsnooze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only. Lifts a snooze early. Usage:
+      Reply to their message:  /unsnooze
+      Or by reference:         /unsnooze @username   /unsnooze 123456789
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /unsnooze в групповом чате."),
+            description="unsnooze_command: wrong chat type reply",
+        )
+        return
+
+    if not await is_group_admin(context, chat.id, update.effective_user.id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использовать /unsnooze могут только администраторы или создатель группы."
+            ),
+            description="unsnooze_command: not admin reply",
+        )
+        return
+
+    chat_id = chat.id
+    args = context.args or []
+    target_id, error = _extract_target(update, args)
+    if error:
+        await call_with_retry(lambda: update.message.reply_text(error), description="unsnooze_command: target not found reply")
+        return
+    if target_id is None:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использование: /unsnooze @username (или ответьте на сообщение участника командой /unsnooze)"
+            ),
+            description="unsnooze_command: usage reply",
+        )
+        return
+
+    was_snoozed = snoozed_until.get(chat_id, {}).pop(target_id, None) is not None
+    was_snoozed = db_clear_snooze(chat_id, target_id) or was_snoozed
+
+    if was_snoozed:
+        name = registered_users.get(chat_id, {}).get(target_id, {}).get("name", str(target_id))
+        text = f"{name} снова может участвовать в раундах этой группы."
+        logger.info("Snooze cleared for user %s in chat %s by admin %s", target_id, chat_id, update.effective_user.id)
+    else:
+        text = "Этот пользователь сейчас не в snooze."
+
+    await call_with_retry(lambda: update.message.reply_text(text), description="unsnooze_command: confirmation reply")
+
+
+async def unregister_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only. Completely removes another user's registration for this
+    group (unlike /snooze, this is permanent -- they'd need to /register
+    again to come back). Usage:
+      Reply to their message:  /unregister_user
+      Or by reference:         /unregister_user @username   /unregister_user 123456789
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /unregister_user в групповом чате."),
+            description="unregister_user_command: wrong chat type reply",
+        )
+        return
+
+    if not await is_group_admin(context, chat.id, update.effective_user.id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использовать /unregister_user могут только администраторы или создатель группы."
+            ),
+            description="unregister_user_command: not admin reply",
+        )
+        return
+
+    chat_id = chat.id
+    args = context.args or []
+    target_id, error = _extract_target(update, args)
+    if error:
+        await call_with_retry(lambda: update.message.reply_text(error), description="unregister_user_command: target not found reply")
+        return
+    if target_id is None:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использование: /unregister_user @username\n"
+                "(или ответьте на сообщение участника командой /unregister_user)"
+            ),
+            description="unregister_user_command: usage reply",
+        )
+        return
+
+    target_name = registered_users.get(chat_id, {}).get(target_id, {}).get("name", str(target_id))
+
+    was_registered = db_remove_registration(chat_id, target_id)  # also clears any snooze row
+    registered_users.get(chat_id, {}).pop(target_id, None)
+    snoozed_until.get(chat_id, {}).pop(target_id, None)
+
+    if was_registered:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                f"Регистрация пользователя {target_name} в этой группе полностью отменена "
+                "администратором. Чтобы участвовать снова, нужно написать /register."
+            ),
+            description="unregister_user_command: confirmation reply",
+        )
+        await call_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"Администратор группы «{chat.title}» отменил вашу регистрацию на "
+                    "исполнение песен. Напишите /register в группе, если захотите участвовать снова."
+                ),
+            ),
+            description=f"unregister_user_command: DM to {target_id}",
+            attempts=1,
+        )
+        logger.info("User %s force-unregistered from chat %s by admin %s", target_id, chat_id, update.effective_user.id)
+    else:
+        await call_with_retry(
+            lambda: update.message.reply_text(f"{target_name} и так не был(а) зарегистрирован(а) в этой группе."),
+            description="unregister_user_command: not registered reply",
+        )
+
+
 async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     global current_round
     r = current_round
@@ -764,7 +1173,7 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     if r.all_confirmed():
         intro = f"\U0001F3AC Песня готова: {r.song['title']}"
         if r.perk:
-            intro += f"\n\U0001F3B2 Задание: {r.perk}"
+            intro += f"\n\U0001F3B2 Модификатор: {r.perk}"
         await call_with_retry(
             lambda: context.bot.send_message(chat_id=r.group_chat_id, text=intro),
             description="finalize_round: intro message",
@@ -772,9 +1181,8 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
         for part_index in range(r.num_parts()):
             submission = r.submissions[part_index]
             label = r.song["parts"][part_index]["label"]
-            performer = registered_users.get(r.group_chat_id, {}).get(
-                submission["user_id"], "участник"
-            )
+            performer_info = registered_users.get(r.group_chat_id, {}).get(submission["user_id"])
+            performer = performer_info["name"] if performer_info else "участник"
             await call_with_retry(
                 lambda label=label, performer=performer, part_index=part_index: context.bot.send_message(
                     chat_id=r.group_chat_id, text=f"Часть {part_index + 1}: {label} \u2014 {performer}"
@@ -827,13 +1235,17 @@ def main():
         raise RuntimeError("Set the SONG_BOT_TOKEN environment variable.")
 
     init_db()
-    global registered_users
+    global registered_users, snoozed_until
     registered_users = load_registrations()
+    snoozed_until = load_snoozes()
     total = sum(len(users) for users in registered_users.values())
     logger.info(
         "Loaded %s registration(s) across %s group(s) from %s",
         total, len(registered_users), DB_FILE,
     )
+    snoozed_total = sum(len(users) for users in snoozed_until.values())
+    if snoozed_total:
+        logger.info("Loaded %s active snooze(s) across %s group(s)", snoozed_total, len(snoozed_until))
 
     # getUpdates (long polling) holds a connection open for its whole poll interval.
     # If it shared a pool with outgoing calls (sendMessage, sendVideoNote, etc.), those
@@ -860,6 +1272,9 @@ def main():
     app.add_handler(CommandHandler("unregister", unregister_command))
     app.add_handler(CommandHandler("playsong", playsong_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("snooze", snooze_command))
+    app.add_handler(CommandHandler("unsnooze", unsnooze_command))
+    app.add_handler(CommandHandler("unregister_user", unregister_user_command))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
