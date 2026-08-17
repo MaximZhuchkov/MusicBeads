@@ -2,9 +2,13 @@
 Bare-bones song relay bot (Russian UI, multi-line song parts).
 
 Flow:
-  1. Participants DM the bot /start to register (kept in memory, no group check yet).
+  1. Participants type /register in a group chat to register as a performer for
+     THAT group (one user can be registered in multiple groups). /unregister
+     removes them from that group's roster. Registrations are persisted to a
+     local SQLite database, so they survive bot restarts.
   2. Someone types /playsong in the group -> bot picks a random song, round-robin
-     assigns parts to registered participants, and DMs each their part(s).
+     assigns parts to that group's registered participants, and DMs each their
+     part(s).
   3. If a participant has multiple parts, they're prompted one at a time. They can
      send a video circle repeatedly (each overwrites the last) and tap "Confirm"
      when happy, which locks in that part and advances to the next one.
@@ -24,20 +28,29 @@ Song JSON schema (see songs/example_song.json):
   multiple lines of lyrics.
 
 Known v1 simplifications (see chat for discussion):
-  - No check that a /start'd user is actually a member of the target group.
-  - Only one round can be active at a time, globally.
-  - State is in-memory only -- a restart loses any in-progress round.
+  - No check that a /register'd user is actually a member of the target group
+    (beyond having typed the command there).
+  - Only one round can be active at a time, globally (across all groups).
+  - Round state (in-progress assignments/submissions) is in-memory only -- a
+    restart loses any in-progress round. Registrations themselves, however,
+    are persisted (see the Persistence section below).
+  - DB access uses plain synchronous sqlite3 calls. Given the tiny read/write
+    volume here (a handful of registrations per command), the brief event-loop
+    block is a non-issue; a busier bot should move this to a thread executor.
 """
 
+import asyncio
 import json
 import logging
 import os
 import random
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -59,13 +72,77 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.environ.get("SONG_BOT_TOKEN")
 SONGS_DIR = Path(__file__).parent / "songs"
-ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 520))
+PERKS_FILE = Path(__file__).parent / "perks"
+DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
+ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
+PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
+
+# ---------------------------------------------------------------------------
+# Persistence (SQLite-backed registrations)
+# ---------------------------------------------------------------------------
+#
+# A registration is a (group_chat_id, user_id) pair -- a user can be registered
+# in several groups at once, and each group has its own independent roster.
+# Everything else (rounds, assignments, submissions) stays in-memory as before.
+
+
+def init_db() -> None:
+    """Create the registrations table if it doesn't exist yet. Safe to call every startup."""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS registrations (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+            """
+        )
+        conn.commit()
+
+
+def load_registrations() -> dict[int, dict[int, str]]:
+    """Load all persisted registrations into the in-memory shape used at runtime:
+    chat_id -> {user_id: display_name}.
+    """
+    result: dict[int, dict[int, str]] = {}
+    with sqlite3.connect(DB_FILE) as conn:
+        for chat_id, user_id, display_name in conn.execute(
+            "SELECT chat_id, user_id, display_name FROM registrations"
+        ):
+            result.setdefault(chat_id, {})[user_id] = display_name
+    return result
+
+
+def db_add_registration(chat_id: int, user_id: int, display_name: str) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO registrations (chat_id, user_id, display_name) VALUES (?, ?, ?) "
+            "ON CONFLICT (chat_id, user_id) DO UPDATE SET display_name = excluded.display_name",
+            (chat_id, user_id, display_name),
+        )
+        conn.commit()
+
+
+def db_remove_registration(chat_id: int, user_id: int) -> bool:
+    """Returns True if a row was actually deleted (i.e. the user was registered)."""
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.execute(
+            "DELETE FROM registrations WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 
-registered_users: dict[int, str] = {}  # user_id -> display name
+# chat_id -> {user_id: display_name}. Mirrors the `registrations` DB table and is
+# populated from it at startup by load_registrations(); every mutation below also
+# writes through to the DB so the two stay in sync.
+registered_users: dict[int, dict[int, str]] = {}
 
 
 class Round:
@@ -83,6 +160,8 @@ class Round:
         self.submissions: dict[int, dict] = {}              # part_index -> {"file_id", "user_id"}
 
         self.active = True
+        self.job = None  # the scheduled finalize_round job, cancelled if the song completes early
+        self.perk: Optional[str] = None  # random modifier for this round, if one was rolled
 
     def num_parts(self) -> int:
         return len(self.song["parts"])
@@ -92,6 +171,46 @@ class Round:
 
 
 current_round: Optional[Round] = None
+
+# ---------------------------------------------------------------------------
+# Network resilience
+# ---------------------------------------------------------------------------
+
+
+async def call_with_retry(coro_factory, description, attempts=3, base_delay=2.0):
+    """Retry a Telegram API call a few times on transient network errors
+    (timeouts, dropped connections -- common on a flaky proxy/VPN path).
+    Does NOT retry on permanent errors (bad request, forbidden, etc.) --
+    those would just fail the same way every time.
+    Returns None (and logs) if every attempt fails, rather than raising, so a
+    caller isn't forced to add its own try/except for this specific failure mode.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            logger.warning("%s failed (attempt %s/%s): %s", description, attempt, attempts, e)
+            if attempt < attempts:
+                await asyncio.sleep(base_delay * attempt)
+    logger.error("%s failed after %s attempts, giving up: %s", description, attempts, last_exc)
+    return None
+
+
+async def answer_callback_query_best_effort(query):
+    """Acknowledge a callback query (clears the button's loading spinner).
+    Purely cosmetic -- the actual confirm logic proceeds regardless of whether
+    this succeeds. Deliberately makes exactly ONE attempt and never retries:
+    Telegram's "query is too old" error (raised once the tap is no longer fresh)
+    gets misclassified by the client library as a timeout-like error, so a naive
+    retry loop would burn several seconds of backoff chasing a condition that
+    retrying can never fix, delaying the real work below for no benefit.
+    """
+    try:
+        await query.answer()
+    except TelegramError as e:
+        logger.warning("query.answer failed (non-fatal, continuing): %s", e)
 
 # ---------------------------------------------------------------------------
 # Song loading
@@ -106,6 +225,26 @@ def load_random_song() -> tuple[dict, str]:
     with open(path, "r", encoding="utf-8") as f:
         song = json.load(f)
     return song, path.name
+
+
+def maybe_pick_perk(probability: float = PERK_PROBABILITY) -> Optional[str]:
+    """With the given probability, return one random line from the perks file
+    (a modifier like "perform with a funny hat"). Returns None if the roll
+    doesn't hit, or if the file is missing/empty.
+    """
+    if random.random() >= probability:
+        return None
+    if not PERKS_FILE.exists():
+        logger.warning("Perks file not found at %s -- skipping perk selection.", PERKS_FILE)
+        return None
+    lines = [
+        line.strip()
+        for line in PERKS_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return None
+    return random.choice(lines)
 
 
 def part_text(part: dict, sep: str = "\n") -> str:
@@ -134,16 +273,19 @@ def assign_parts(song: dict, participant_ids: list[int]) -> dict[int, list[int]]
 # ---------------------------------------------------------------------------
 
 
+BLOCK_SEPARATOR = "\n\n\U0001F338\n\n"  # two blank lines + a flower emoji between each song block
+
+
 def build_overview_message(song: dict, assigned_indices: list[int]) -> str:
     assigned_set = set(assigned_indices)
-    lines = [f"<b>{song['title']}</b>", ""]
+    blocks = []
     for i, part in enumerate(song["parts"]):
-        joined = part_text(part, sep=" ")
+        joined = part_text(part, sep="\n")
         if i in assigned_set:
-            lines.append(f"\U0001F449 <b>{part['label']}: {joined}</b>")
+            blocks.append(f"\U0001F449 <b>{part['label']}:\n{joined}</b>")
         else:
-            lines.append(f"{part['label']}: {joined}")
-    return "\n".join(lines)
+            blocks.append(f"{part['label']}:\n{joined}")
+    return f"<b>{song['title']}</b>\n\n" + BLOCK_SEPARATOR.join(blocks)
 
 
 def build_prompt_text(song: dict, part_index: int, step: int, total: int) -> str:
@@ -168,12 +310,96 @@ CONFIRM_BUTTON = InlineKeyboardMarkup(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    registered_users[user.id] = user.first_name or user.username or str(user.id)
-    await update.message.reply_text(
-        "Вы зарегистрированы! Когда в группе начнётся раунд, я пришлю вам сюда вашу партию."
+    # Purely informational -- it no longer registers anyone by itself. Telegram
+    # only lets a bot DM a user who has opened a private chat with it at least
+    # once, so this doubles as the "unlock DMs" step before /register in a group.
+    await call_with_retry(
+        lambda: update.message.reply_text(
+            "Привет! Чтобы участвовать в исполнении песен:\n"
+            "1. Добавьте меня в группу, где будете выступать.\n"
+            "2. Напишите /register в этой группе — так я запомню, что вы участвуете "
+            "именно в её раунде (можно регистрироваться сразу в нескольких группах).\n"
+            "3. Я буду присылать вам вашу партию сюда, в личные сообщения, когда "
+            "в группе запустят /playsong.\n\n"
+            "Чтобы перестать участвовать в конкретной группе, напишите там /unregister."
+        ),
+        description="start_command reply",
     )
-    logger.info("Registered user %s (%s)", user.id, registered_users[user.id])
+
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Напишите /register в той группе, в которой хотите участвовать в исполнении песен."
+            ),
+            description="register_command: wrong chat type reply",
+        )
+        return
+
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    display_name = user.first_name or user.username or str(user.id)
+
+    db_add_registration(chat_id, user.id, display_name)
+    registered_users.setdefault(chat_id, {})[user.id] = display_name
+
+    await call_with_retry(
+        lambda: update.message.reply_text(
+            f"\u2705 {display_name}, вы зарегистрированы для исполнения песен в этой группе!"
+        ),
+        description="register_command: confirmation reply",
+    )
+
+    # Best-effort heads-up in DM. If this fails, the user most likely hasn't
+    # opened a private chat with the bot yet -- warn them in the group, since
+    # without that the bot won't be able to send them their part later.
+    dm_ok = await call_with_retry(
+        lambda: context.bot.send_message(
+            chat_id=user.id,
+            text=f"Вы зарегистрированы для исполнения песен в группе «{update.effective_chat.title}».",
+        ),
+        description=f"register_command: DM confirmation to {user.id}",
+        attempts=1,
+    )
+    if dm_ok is None:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                f"\u26a0\ufe0f {display_name}, похоже, я не могу написать вам в личные сообщения. "
+                "Откройте со мной личный чат и нажмите /start, иначе я не смогу прислать вам вашу партию."
+            ),
+            description="register_command: DM-unreachable warning",
+        )
+
+    logger.info("Registered user %s (%s) for chat %s", user.id, display_name, chat_id)
+
+
+async def unregister_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Напишите /unregister в той группе, участие в которой хотите отменить."
+            ),
+            description="unregister_command: wrong chat type reply",
+        )
+        return
+
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    was_registered = db_remove_registration(chat_id, user.id)
+    registered_users.get(chat_id, {}).pop(user.id, None)
+
+    if was_registered:
+        text = "Вы отменили регистрацию на исполнение песен в этой группе."
+        logger.info("Unregistered user %s from chat %s", user.id, chat_id)
+    else:
+        text = "Вы и так не были зарегистрированы в этой группе."
+
+    await call_with_retry(
+        lambda: update.message.reply_text(text),
+        description="unregister_command reply",
+    )
 
 
 async def send_next_prompt(context: ContextTypes.DEFAULT_TYPE, participant_id: int):
@@ -184,62 +410,85 @@ async def send_next_prompt(context: ContextTypes.DEFAULT_TYPE, participant_id: i
         return
     part_index = r.assignments[participant_id][pointer]
     text = build_prompt_text(r.song, part_index, pointer + 1, total)
-    await context.bot.send_message(chat_id=participant_id, text=text, parse_mode=ParseMode.HTML)
+    await call_with_retry(
+        lambda: context.bot.send_message(chat_id=participant_id, text=text, parse_mode=ParseMode.HTML),
+        description=f"prompt to {participant_id}",
+    )
 
 
 async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global current_round
 
     if update.effective_chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Запустите /playsong в групповом чате.")
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /playsong в групповом чате."),
+            description="playsong: wrong chat type reply",
+        )
         return
 
     if current_round is not None and current_round.active:
-        await update.message.reply_text("Раунд уже идёт.")
+        await call_with_retry(
+            lambda: update.message.reply_text("Раунд уже идёт."),
+            description="playsong: already in progress reply",
+        )
         return
 
-    if not registered_users:
-        await update.message.reply_text(
-            "Пока никто не зарегистрировался. Попросите участников написать мне /start в личные сообщения."
+    group_registrations = registered_users.get(update.effective_chat.id, {})
+    if not group_registrations:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Пока никто не зарегистрировался в этой группе. Попросите участников "
+                "написать здесь /register."
+            ),
+            description="playsong: no participants reply",
         )
         return
 
     song, filename = load_random_song()
-    participant_ids = list(registered_users.keys())
+    participant_ids = list(group_registrations.keys())
     assignments = assign_parts(song, participant_ids)
 
     r = Round(song, filename, update.effective_chat.id, participant_ids)
     r.assignments = assignments
     r.current_pointer = {pid: 0 for pid in participant_ids}
+    r.perk = maybe_pick_perk()
     current_round = r
 
-    try:
-        await update.message.reply_text(
-            f"\U0001F3B5 Начинаем раунд: <b>{song['title']}</b>\n"
-            f"Проверьте личные сообщения \u2014 там ваша партия. "
-            f"У вас есть {ROUND_DURATION_SECONDS // 60} минут.",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        # Don't let a transient send failure (e.g. a network timeout) abort the whole
-        # function -- the round is already created, so the timer below must still get
-        # scheduled or the round would be stuck "active" forever.
-        logger.warning("Could not announce round start in group: %s", e)
+    # The round is already created above, so even if every send below fails
+    # (e.g. a proxy outage), the timer scheduled at the end of this function
+    # must still run -- otherwise the round would be stuck "active" forever.
+    announcement = (
+        f"\U0001F3B5 Начинаем раунд: <b>{song['title']}</b>\n"
+        f"Проверьте личные сообщения \u2014 там ваша партия. "
+        f"У вас есть {ROUND_DURATION_SECONDS // 60} минут."
+    )
+    if r.perk:
+        announcement += f"\n\n\U0001F3B2 Модификатор: <b>{r.perk}</b>"
+    await call_with_retry(
+        lambda: update.message.reply_text(announcement, parse_mode=ParseMode.HTML),
+        description="playsong: round start announcement",
+    )
 
     for pid in participant_ids:
         if not assignments[pid]:
             continue  # more participants than parts; this one sits out this round
         try:
-            await context.bot.send_message(
-                chat_id=pid,
-                text=build_overview_message(song, assignments[pid]),
-                parse_mode=ParseMode.HTML,
+            await call_with_retry(
+                lambda pid=pid: context.bot.send_message(
+                    chat_id=pid,
+                    text=build_overview_message(song, assignments[pid]),
+                    parse_mode=ParseMode.HTML,
+                ),
+                description=f"overview DM to {pid}",
             )
             await send_next_prompt(context, pid)
         except Exception as e:
+            # Non-network failures (e.g. Forbidden if this person blocked the bot)
+            # shouldn't stop the rest of the group from being DM'd, and the timer
+            # below must still get scheduled regardless.
             logger.warning("Could not DM participant %s: %s", pid, e)
 
-    context.job_queue.run_once(finalize_round, ROUND_DURATION_SECONDS, name="finalize_round")
+    r.job = context.job_queue.run_once(finalize_round, ROUND_DURATION_SECONDS, name="finalize_round")
 
 
 async def video_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,31 +496,43 @@ async def video_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
 
     if r is None or not r.active:
-        await update.message.reply_text(
-            "Сейчас нет активного раунда. Дождитесь /playsong в группе."
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Сейчас нет активного раунда. Дождитесь /playsong в группе."
+            ),
+            description="video_note_handler: no active round reply",
         )
         return
 
     if user_id not in r.assignments or not r.assignments[user_id]:
         # Most common cause: this person registered (/start) after the round already
         # started, so they were never included in the part assignments.
-        await update.message.reply_text(
-            "Вы не участвуете в текущем раунде (возможно, вы зарегистрировались уже "
-            "после того, как раунд начался). Дождитесь следующего /playsong."
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Вы не участвуете в текущем раунде (возможно, вы зарегистрировались уже "
+                "после того, как раунд начался). Дождитесь следующего /playsong."
+            ),
+            description="video_note_handler: not in round reply",
         )
         return
 
     pointer = r.current_pointer.get(user_id, 0)
     total = len(r.assignments[user_id])
     if pointer >= total:
-        await update.message.reply_text("Вы уже отправили все свои части в этом раунде.")
+        await call_with_retry(
+            lambda: update.message.reply_text("Вы уже отправили все свои части в этом раунде."),
+            description="video_note_handler: already done reply",
+        )
         return
 
     file_id = update.message.video_note.file_id
     r.pending_take[user_id] = file_id
-    await update.message.reply_text(
-        "Принято! Пришлите другой дубль, чтобы заменить, или нажмите «Подтвердить», когда будете готовы.",
-        reply_markup=CONFIRM_BUTTON,
+    await call_with_retry(
+        lambda: update.message.reply_text(
+            "Принято! Пришлите другой дубль, чтобы заменить, или нажмите «Подтвердить», когда будете готовы.",
+            reply_markup=CONFIRM_BUTTON,
+        ),
+        description="video_note_handler: confirm button reply",
     )
 
 
@@ -281,10 +542,13 @@ async def wrong_video_type_handler(update: Update, context: ContextTypes.DEFAULT
     # confusing -- tell the participant what went wrong instead.
     r = current_round
     if r is not None and r.active and update.effective_user.id in r.assignments:
-        await update.message.reply_text(
-            "Это обычное видео, а не видеокружок \u2014 запишите именно круглое "
-            "видеосообщение (в Telegram: значок камеры с кружком в поле ввода) "
-            "и пришлите его сюда."
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Это обычное видео, а не видеокружок \u2014 запишите именно круглое "
+                "видеосообщение (в Telegram: значок камеры с кружком в поле ввода) "
+                "и пришлите его сюда."
+            ),
+            description="wrong_video_type_handler reply",
         )
 
 
@@ -292,15 +556,21 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = current_round
     query = update.callback_query
     user_id = query.from_user.id
-    await query.answer()
+    await answer_callback_query_best_effort(query)
 
     if r is None or not r.active or user_id not in r.assignments:
-        await query.edit_message_text("Этот раунд уже завершён.")
+        await call_with_retry(
+            lambda: query.edit_message_text("Этот раунд уже завершён."),
+            description="confirm_callback: round over reply",
+        )
         return
 
     take = r.pending_take.get(user_id)
     if take is None:
-        await query.edit_message_text("Сначала пришлите видеокружок, потом подтвердите.")
+        await call_with_retry(
+            lambda: query.edit_message_text("Сначала пришлите видеокружок, потом подтвердите."),
+            description="confirm_callback: no take reply",
+        )
         return
 
     pointer = r.current_pointer[user_id]
@@ -309,14 +579,40 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del r.pending_take[user_id]
     r.current_pointer[user_id] += 1
 
-    await query.edit_message_text(f"\u2705 Зафиксировано: {r.song['parts'][part_index]['label']}")
+    await call_with_retry(
+        lambda: query.edit_message_text(f"\u2705 Зафиксировано: {r.song['parts'][part_index]['label']}"),
+        description="confirm_callback: locked-in reply",
+    )
+
+    song_complete = r.all_confirmed()
 
     if r.current_pointer[user_id] < len(r.assignments[user_id]):
         await send_next_prompt(context, user_id)
     else:
-        await context.bot.send_message(
-            chat_id=user_id, text="Вы всё сделали! Ждём остальных участников группы."
+        await call_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=user_id, text="Вы всё сделали! Ждём остальных участников группы."
+            ),
+            description="confirm_callback: all done reply",
         )
+        if not song_complete:
+            # If the song just became 100% complete, skip this -- finalize_round
+            # (triggered below) posts its own "song ready" message instead, and a
+            # "95%... 100%!" pair right before it would just be noise.
+            percent = round(100 * len(r.submissions) / r.num_parts())
+            await call_with_retry(
+                lambda: context.bot.send_message(
+                    chat_id=r.group_chat_id,
+                    text=f"Песня {r.song['title']} исполнена на {percent} %",
+                ),
+                description="confirm_callback: group progress update",
+            )
+
+    if song_complete:
+        # Every part is in -- publish now rather than waiting out the rest of the timer.
+        if r.job is not None:
+            r.job.schedule_removal()
+        await finalize_round(context)
 
 
 async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
@@ -327,26 +623,49 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     r.active = False
 
     if r.all_confirmed():
-        await context.bot.send_message(
-            chat_id=r.group_chat_id, text=f"\U0001F3AC Песня готова: {r.song['title']}"
+        intro = f"\U0001F3AC Песня готова: {r.song['title']}"
+        if r.perk:
+            intro += f"\n\U0001F3B2 Модификатор: {r.perk}"
+        await call_with_retry(
+            lambda: context.bot.send_message(chat_id=r.group_chat_id, text=intro),
+            description="finalize_round: intro message",
         )
         for part_index in range(r.num_parts()):
             submission = r.submissions[part_index]
             label = r.song["parts"][part_index]["label"]
-            performer = registered_users.get(submission["user_id"], "участник")
-            await context.bot.send_message(
-                chat_id=r.group_chat_id, text=f"Часть {part_index + 1}: {label} \u2014 {performer}"
+            performer = registered_users.get(r.group_chat_id, {}).get(
+                submission["user_id"], "участник"
             )
-            await context.bot.send_video_note(chat_id=r.group_chat_id, video_note=submission["file_id"])
+            await call_with_retry(
+                lambda label=label, performer=performer, part_index=part_index: context.bot.send_message(
+                    chat_id=r.group_chat_id, text=f"Часть {part_index + 1}: {label} \u2014 {performer}"
+                ),
+                description=f"finalize_round: caption for part {part_index}",
+            )
+            # Keep going even if this one clip ultimately fails to send after
+            # retries -- one dropped connection shouldn't cancel the rest of
+            # the performance.
+            await call_with_retry(
+                lambda submission=submission: context.bot.send_video_note(
+                    chat_id=r.group_chat_id, video_note=submission["file_id"]
+                ),
+                description=f"finalize_round: video note for part {part_index}",
+            )
     else:
         missing = r.num_parts() - len(r.submissions)
-        await context.bot.send_message(
-            chat_id=r.group_chat_id,
-            text=(
-                f"\u274c Песня {r.filename} не была исполнена полностью "
-                f"(не хватает частей: {missing}). Введите /playsong ещё раз, чтобы выбрать новую песню."
-            ),
+        failure_text = (
+            f"\u274c Песня {r.filename} не была исполнена полностью "
+            f"(не хватает частей: {missing}). Введите /playsong ещё раз, чтобы выбрать новую песню."
         )
+        await call_with_retry(
+            lambda: context.bot.send_message(chat_id=r.group_chat_id, text=failure_text),
+            description="finalize_round: incomplete-song group announcement",
+        )
+        for pid in r.participant_ids:
+            await call_with_retry(
+                lambda pid=pid: context.bot.send_message(chat_id=pid, text=failure_text),
+                description=f"finalize_round: incomplete-song DM to {pid}",
+            )
 
     current_round = None
 
@@ -367,6 +686,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Set the SONG_BOT_TOKEN environment variable.")
+
+    init_db()
+    global registered_users
+    registered_users = load_registrations()
+    total = sum(len(users) for users in registered_users.values())
+    logger.info(
+        "Loaded %s registration(s) across %s group(s) from %s",
+        total, len(registered_users), DB_FILE,
+    )
 
     # getUpdates (long polling) holds a connection open for its whole poll interval.
     # If it shared a pool with outgoing calls (sendMessage, sendVideoNote, etc.), those
@@ -389,6 +717,8 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("register", register_command))
+    app.add_handler(CommandHandler("unregister", unregister_command))
     app.add_handler(CommandHandler("playsong", playsong_command))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))

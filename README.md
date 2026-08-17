@@ -5,7 +5,7 @@
 ```bash
 pip install -r requirements.txt
 export SONG_BOT_TOKEN="your-bot-token"
-python bot.py
+python bot__.py
 ```
 
 Requires Python 3.9+.
