@@ -15,6 +15,15 @@ Flow:
   4. After ROUND_DURATION_SECONDS, the bot checks whether every part was confirmed.
      If yes, it posts each video circle to the group in song order. If no, it
      announces the song as incomplete and the round ends.
+  5. At any point during an active round, /cancel (typed in the group, or in DM
+     by one of that round's participants) immediately ends it and notifies both
+     the group and every participant who had a part.
+
+Song selection avoids repeats: each group won't be given the same song twice in
+a row across separate /playsong runs until every song in songs/ has come up for
+that group, at which point the rotation for that group resets. This tracking is
+in-memory only -- it resets when the bot restarts, so a restart can hand out a
+song that was already played in the previous run.
 
 Song JSON schema (see songs/example_song.json):
   {
@@ -37,6 +46,12 @@ Known v1 simplifications (see chat for discussion):
   - DB access uses plain synchronous sqlite3 calls. Given the tiny read/write
     volume here (a handful of registrations per command), the brief event-loop
     block is a non-issue; a busier bot should move this to a thread executor.
+  - /playsong and /cancel are restricted to group administrators/creator
+    (checked live via getChatMember at command time -- not cached, so a
+    demotion/promotion takes effect on the very next command). /register and
+    /unregister remain open to everyone.
+  - Per-group "already played" song tracking is in-memory only (see module
+    docstring above); it is deliberately NOT persisted to the DB.
 """
 
 import asyncio
@@ -75,7 +90,7 @@ SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
 ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
-PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
+PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.5))
 
 # ---------------------------------------------------------------------------
 # Persistence (SQLite-backed registrations)
@@ -143,6 +158,10 @@ def db_remove_registration(chat_id: int, user_id: int) -> bool:
 # populated from it at startup by load_registrations(); every mutation below also
 # writes through to the DB so the two stay in sync.
 registered_users: dict[int, dict[int, str]] = {}
+
+# chat_id -> set of song filenames already picked for that group. Intentionally
+# NOT persisted -- starts empty every time the bot restarts (see module docstring).
+played_songs: dict[int, set[str]] = {}
 
 
 class Round:
@@ -212,19 +231,56 @@ async def answer_callback_query_best_effort(query):
     except TelegramError as e:
         logger.warning("query.answer failed (non-fatal, continuing): %s", e)
 
+
+async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """Whether `user_id` is currently an administrator or the creator of `chat_id`.
+    Checked live against Telegram on every call (no caching), so a promotion or
+    demotion takes effect immediately on the next command. Fails "closed" --
+    any lookup error (network trouble that survives retries, or a permanent
+    error like the bot no longer being in that chat) is treated as "not an
+    admin" rather than silently granting access.
+    """
+    try:
+        member = await call_with_retry(
+            lambda: context.bot.get_chat_member(chat_id, user_id),
+            description=f"admin check for user {user_id} in chat {chat_id}",
+        )
+    except TelegramError as e:
+        # call_with_retry only retries transient network errors; a permanent
+        # error (e.g. BadRequest, Forbidden) surfaces here instead of looping.
+        logger.warning("Admin check failed for user %s in chat %s: %s", user_id, chat_id, e)
+        return False
+    if member is None:
+        return False
+    return member.status in ("administrator", "creator")
+
 # ---------------------------------------------------------------------------
 # Song loading
 # ---------------------------------------------------------------------------
 
 
-def load_random_song() -> tuple[dict, str]:
+def load_random_song(exclude: Optional[set[str]] = None) -> tuple[dict, str, bool]:
+    """Pick a random song file, skipping any filename in `exclude`.
+
+    If every available song is excluded (the group has cycled through the
+    whole catalog), the exclusion is ignored for this pick and any song may be
+    chosen -- the caller is responsible for resetting its own tracking in that
+    case. Returns (song, filename, exhausted) where `exhausted` signals that
+    the exclusion set covered every file, so the caller should reset it before
+    recording this pick.
+    """
     files = sorted(SONGS_DIR.glob("*.json"))
     if not files:
         raise RuntimeError(f"No song files found in {SONGS_DIR}")
-    path = random.choice(files)
+    exclude = exclude or set()
+    available = [f for f in files if f.name not in exclude]
+    exhausted = not available
+    if exhausted:
+        available = files
+    path = random.choice(available)
     with open(path, "r", encoding="utf-8") as f:
         song = json.load(f)
-    return song, path.name
+    return song, path.name, exhausted
 
 
 def maybe_pick_perk(probability: float = PERK_PROBABILITY) -> Optional[str]:
@@ -426,6 +482,15 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not await is_group_admin(context, update.effective_chat.id, update.effective_user.id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Запускать /playsong могут только администраторы или создатель группы."
+            ),
+            description="playsong: not admin reply",
+        )
+        return
+
     if current_round is not None and current_round.active:
         await call_with_retry(
             lambda: update.message.reply_text("Раунд уже идёт."),
@@ -444,7 +509,15 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    song, filename = load_random_song()
+    chat_id = update.effective_chat.id
+    song, filename, exhausted = load_random_song(exclude=played_songs.get(chat_id))
+    if exhausted:
+        # Every song has already been played for this group -- start a fresh
+        # rotation rather than refusing to play.
+        played_songs[chat_id] = set()
+        logger.info("Song rotation for chat %s exhausted; resetting.", chat_id)
+    played_songs.setdefault(chat_id, set()).add(filename)
+
     participant_ids = list(group_registrations.keys())
     assignments = assign_parts(song, participant_ids)
 
@@ -463,7 +536,7 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"У вас есть {ROUND_DURATION_SECONDS // 60} минут."
     )
     if r.perk:
-        announcement += f"\n\n\U0001F3B2 Модификатор: <b>{r.perk}</b>"
+        announcement += f"\n\n\U0001F3B2 Задание: <b>{r.perk}</b>"
     await call_with_retry(
         lambda: update.message.reply_text(announcement, parse_mode=ParseMode.HTML),
         description="playsong: round start announcement",
@@ -615,6 +688,72 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finalize_round(context)
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately cancels the active round, wherever it's at, and notifies the
+    group plus every participant who had a part assigned. Only an administrator
+    or the creator of the round's group may do this. Can be invoked either from
+    that group directly, or via DM (useful if the group chat itself is
+    unreachable) -- either way, permission is checked against the round's
+    group, not the chat the command was typed in.
+    """
+    global current_round
+    r = current_round
+
+    if r is None or not r.active:
+        await call_with_retry(
+            lambda: update.message.reply_text("Сейчас нет активного раунда для отмены."),
+            description="cancel_command: no active round reply",
+        )
+        return
+
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+    called_from_group = chat.type in ("group", "supergroup") and chat.id == r.group_chat_id
+    called_from_dm = chat.type == "private"
+
+    if not (called_from_group or called_from_dm):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Эту команду нужно вызвать в группе, где идёт раунд, либо в личных сообщениях."
+            ),
+            description="cancel_command: wrong context reply",
+        )
+        return
+
+    if not await is_group_admin(context, r.group_chat_id, user_id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Отменять исполнение песни могут только администраторы или создатель группы."
+            ),
+            description="cancel_command: not admin reply",
+        )
+        return
+
+    r.active = False
+    if r.job is not None:
+        r.job.schedule_removal()
+
+    song_title = r.song["title"]
+    text = f"\u274c Исполнение песни «{song_title}» отменено."
+
+    await call_with_retry(
+        lambda: context.bot.send_message(chat_id=r.group_chat_id, text=text),
+        description="cancel_command: group announcement",
+    )
+    for pid in r.participant_ids:
+        if not r.assignments.get(pid):
+            continue  # sat out this round (more participants than parts); nothing to tell them
+        await call_with_retry(
+            lambda pid=pid: context.bot.send_message(chat_id=pid, text=text),
+            description=f"cancel_command: DM to {pid}",
+        )
+
+    logger.info(
+        "Round for chat %s (song file %s) cancelled by user %s", r.group_chat_id, r.filename, user_id
+    )
+    current_round = None
+
+
 async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     global current_round
     r = current_round
@@ -625,7 +764,7 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     if r.all_confirmed():
         intro = f"\U0001F3AC Песня готова: {r.song['title']}"
         if r.perk:
-            intro += f"\n\U0001F3B2 Модификатор: {r.perk}"
+            intro += f"\n\U0001F3B2 Задание: {r.perk}"
         await call_with_retry(
             lambda: context.bot.send_message(chat_id=r.group_chat_id, text=intro),
             description="finalize_round: intro message",
@@ -720,6 +859,7 @@ def main():
     app.add_handler(CommandHandler("register", register_command))
     app.add_handler(CommandHandler("unregister", unregister_command))
     app.add_handler(CommandHandler("playsong", playsong_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
