@@ -31,6 +31,11 @@ registrants who'd otherwise leave a song perpetually incomplete:
   reliable) or with `@username`/a numeric id, resolved among users already
   registered in that group.
 
+/stats (open to everyone, run in the group) gives a friendly, emoji-led
+snapshot: who's registered, who's currently snoozed (and until when), and the
+outcome of every song played since the bot last started (✅ success,
+❌ timed out incomplete, 🚫 cancelled by an admin).
+
 Song selection avoids repeats: each group won't be given the same song twice in
 a row across separate /playsong runs until every song in songs/ has come up for
 that group, at which point the rotation for that group resets. This tracking is
@@ -64,7 +69,11 @@ Known v1 simplifications (see chat for discussion):
     /unregister remain open to everyone. /snooze, /unsnooze, and
     /unregister_user are likewise admin-only.
   - Per-group "already played" song tracking is in-memory only (see module
-    docstring above); it is deliberately NOT persisted to the DB.
+    docstring above); it is deliberately NOT persisted to the DB. Note that a
+    song counts as "played" for that exclusion the moment it's *selected* by
+    /playsong, regardless of whether the round then succeeds, times out, or
+    gets /cancel'd -- the separate song_history used by /stats records that
+    same event again, but tagged with its eventual outcome.
   - @username resolution for /snooze, /unsnooze, and /unregister_user only
     works for users already registered in that group -- Telegram's Bot API
     has no general username-to-id lookup. Replying to the target's message
@@ -108,7 +117,7 @@ BOT_TOKEN = os.environ.get("SONG_BOT_TOKEN")
 SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
-ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
+ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 900))
 PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
 
 # ---------------------------------------------------------------------------
@@ -237,6 +246,25 @@ snoozed_until: dict[int, dict[int, int]] = {}
 # chat_id -> set of song filenames already picked for that group. Intentionally
 # NOT persisted -- starts empty every time the bot restarts (see module docstring).
 played_songs: dict[int, set[str]] = {}
+
+# chat_id -> list of {"title", "status", "timestamp"} in the order they happened.
+# status is one of "success" / "incomplete" / "cancelled". Intentionally NOT
+# persisted -- /stats only reports what happened since the current bot process
+# started, same lifetime as played_songs above.
+song_history: dict[int, list[dict]] = {}
+
+SONG_STATUS_EMOJI = {"success": "\u2705", "incomplete": "\u274c", "cancelled": "\U0001F6AB"}
+SONG_STATUS_TEXT = {
+    "success": "исполнена полностью",
+    "incomplete": "не хватило времени/участников",
+    "cancelled": "отменена администратором",
+}
+
+
+def record_song_history(chat_id: int, title: str, status: str) -> None:
+    song_history.setdefault(chat_id, []).append(
+        {"title": title, "status": status, "timestamp": datetime.now(timezone.utc)}
+    )
 
 
 class Round:
@@ -886,6 +914,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if r.job is not None:
         r.job.schedule_removal()
 
+    record_song_history(r.group_chat_id, r.song["title"], "cancelled")
+
     song_title = r.song["title"]
     text = f"\u274c Исполнение песни «{song_title}» отменено."
 
@@ -1163,6 +1193,69 @@ async def unregister_user_command(update: Update, context: ContextTypes.DEFAULT_
         )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open to everyone (not admin-only) -- a friendly, emoji-led snapshot of
+    this group's roster (who's registered, who's snoozed) and every song
+    played since the bot process last started (see song_history above for why
+    that history doesn't survive a restart).
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /stats в групповом чате."),
+            description="stats_command: wrong chat type reply",
+        )
+        return
+
+    chat_id = chat.id
+    group_registrations = registered_users.get(chat_id, {})
+
+    participant_lines = []
+    active_count = 0
+    for uid, info in sorted(group_registrations.items(), key=lambda kv: kv[1]["name"].lower()):
+        name = info["name"]
+        if is_snoozed(chat_id, uid):  # also lazily clears expired snoozes as a side effect
+            until_ts = snoozed_until[chat_id][uid]
+            until_str = datetime.fromtimestamp(until_ts, tz=timezone.utc).strftime("%d.%m %H:%M UTC")
+            participant_lines.append(f"\u2022 {name} \U0001F634 <i>(на паузе до {until_str})</i>")
+        else:
+            participant_lines.append(f"\u2022 {name} \u2705")
+            active_count += 1
+
+    total = len(group_registrations)
+    snoozed_count = total - active_count
+
+    lines = [f"\U0001F4CA <b>Статистика группы «{chat.title}»</b>", ""]
+    lines.append(f"\U0001F465 Зарегистрировано участников: <b>{total}</b>")
+    lines.append(f"\u2705 Готовы выступать прямо сейчас: <b>{active_count}</b>")
+    lines.append(f"\U0001F634 На паузе (snooze): <b>{snoozed_count}</b>")
+    lines.append("")
+
+    if participant_lines:
+        lines.append("<b>\U0001F465 Участники:</b>")
+        lines.extend(participant_lines)
+    else:
+        lines.append("Пока никто не зарегистрировался. Напишите /register, чтобы начать! \U0001F3A4")
+
+    lines.append("")
+    lines.append("\U0001F3B5 <b>Песни с момента последнего запуска бота</b> <i>(сначала свежие)</i>:")
+    history = song_history.get(chat_id, [])
+    if history:
+        for i, entry in enumerate(reversed(history), start=1):
+            emoji = SONG_STATUS_EMOJI.get(entry["status"], "\u2753")
+            status = SONG_STATUS_TEXT.get(entry["status"], entry["status"])
+            when = entry["timestamp"].strftime("%d.%m %H:%M UTC")
+            lines.append(f"{i}. {emoji} «{entry['title']}» \u2014 {status} <i>({when})</i>")
+    else:
+        lines.append("Пока ни одна песня не была сыграна. Запустите /playsong! \U0001F3A7")
+
+    text = "\n".join(lines)
+    await call_with_retry(
+        lambda: update.message.reply_text(text, parse_mode=ParseMode.HTML),
+        description="stats_command reply",
+    )
+
+
 async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     global current_round
     r = current_round
@@ -1171,6 +1264,7 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     r.active = False
 
     if r.all_confirmed():
+        record_song_history(r.group_chat_id, r.song["title"], "success")
         intro = f"\U0001F3AC Песня готова: {r.song['title']}"
         if r.perk:
             intro += f"\n\U0001F3B2 Модификатор: {r.perk}"
@@ -1199,6 +1293,7 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
                 description=f"finalize_round: video note for part {part_index}",
             )
     else:
+        record_song_history(r.group_chat_id, r.song["title"], "incomplete")
         missing = r.num_parts() - len(r.submissions)
         failure_text = (
             f"\u274c Песня {r.filename} не была исполнена полностью "
@@ -1275,6 +1370,7 @@ def main():
     app.add_handler(CommandHandler("snooze", snooze_command))
     app.add_handler(CommandHandler("unsnooze", unsnooze_command))
     app.add_handler(CommandHandler("unregister_user", unregister_user_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
