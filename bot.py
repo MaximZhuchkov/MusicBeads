@@ -117,7 +117,7 @@ BOT_TOKEN = os.environ.get("SONG_BOT_TOKEN")
 SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
-ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 900))
+ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
 PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
 
 # ---------------------------------------------------------------------------

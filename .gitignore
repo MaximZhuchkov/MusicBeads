@@ -8,6 +8,7 @@ registrations.db
 .vscode/
 *.swp
 *.swo
+*.iml
 
 # Зависимости
 node_modules/
