@@ -6,18 +6,25 @@ Flow:
      THAT group (one user can be registered in multiple groups). /unregister
      removes them from that group's roster. Registrations are persisted to a
      local SQLite database, so they survive bot restarts.
-  2. Someone types /playsong in the group -> bot picks a random song, round-robin
-     assigns parts to that group's registered participants, and DMs each their
-     part(s).
-  3. If a participant has multiple parts, they're prompted one at a time. They can
+  2. Someone types /playsong in the group -> bot picks a random song and DMs
+     every active (non-snoozed) registered participant in that group asking
+     whether they're ready to perform it, song name included. Anyone who taps
+     "Нет" or doesn't respond within READINESS_CHECK_SECONDS (default 5
+     minutes) is excluded from this song -- no part is assigned to them.
+  3. Once every candidate has answered (or the 5 minutes are up, whichever
+     comes first), the bot round-robin assigns parts among whoever said "Да"
+     and DMs each their part(s). If nobody said "Да", the round is cancelled
+     before it starts and no parts are assigned to anyone.
+  4. If a participant has multiple parts, they're prompted one at a time. They can
      send a video circle repeatedly (each overwrites the last) and tap "Confirm"
      when happy, which locks in that part and advances to the next one.
-  4. After ROUND_DURATION_SECONDS, the bot checks whether every part was confirmed.
+  5. After ROUND_DURATION_SECONDS, the bot checks whether every part was confirmed.
      If yes, it posts each video circle to the group in song order. If no, it
      announces the song as incomplete and the round ends.
-  5. At any point during an active round, /cancel (typed in the group, or in DM
-     by one of that round's participants) immediately ends it and notifies both
-     the group and every participant who had a part.
+  6. At any point during an active round (or the readiness poll that precedes
+     it), /cancel (typed in the group, or in DM by one of that round's
+     participants) immediately ends it and notifies both the group and every
+     participant who had a part or was asked about readiness.
 
 Admin tools (group administrators/creator only) for dealing with inactive
 registrants who'd otherwise leave a song perpetually incomplete:
@@ -81,6 +88,7 @@ Known v1 simplifications (see chat for discussion):
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -117,7 +125,8 @@ BOT_TOKEN = os.environ.get("SONG_BOT_TOKEN")
 SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
-ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 300))
+ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 900))
+READINESS_CHECK_SECONDS = int(os.environ.get("READINESS_CHECK_SECONDS", 300))
 PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
 
 # ---------------------------------------------------------------------------
@@ -253,11 +262,17 @@ played_songs: dict[int, set[str]] = {}
 # started, same lifetime as played_songs above.
 song_history: dict[int, list[dict]] = {}
 
-SONG_STATUS_EMOJI = {"success": "\u2705", "incomplete": "\u274c", "cancelled": "\U0001F6AB"}
+SONG_STATUS_EMOJI = {
+    "success": "\u2705",
+    "incomplete": "\u274c",
+    "cancelled": "\U0001F6AB",
+    "no_participants": "\U0001F614",
+}
 SONG_STATUS_TEXT = {
     "success": "исполнена полностью",
     "incomplete": "не хватило времени/участников",
     "cancelled": "отменена администратором",
+    "no_participants": "никто не подтвердил готовность",
 }
 
 
@@ -293,6 +308,27 @@ class Round:
 
 
 current_round: Optional[Round] = None
+
+
+class ReadinessCheck:
+    """Holds state for the pre-round readiness poll that runs before a Round
+    is created: every active (non-snoozed) registered participant is DM'd
+    asking whether they're in for this song, and only whoever answers "Да"
+    within READINESS_CHECK_SECONDS goes on to receive an assigned part."""
+
+    def __init__(self, song: dict, filename: str, group_chat_id: int, candidate_ids: list[int]):
+        self.song = song
+        self.filename = filename
+        self.group_chat_id = group_chat_id
+        self.candidate_ids = candidate_ids
+
+        self.responses: dict[int, bool] = {}  # participant_id -> True ("Да") / False ("Нет")
+
+        self.active = True
+        self.job = None  # the scheduled resolve_readiness_check job, cancelled if everyone answers early
+
+
+current_readiness_check: Optional[ReadinessCheck] = None
 
 
 def is_snoozed(chat_id: int, user_id: int) -> bool:
@@ -526,6 +562,24 @@ def build_prompt_text(song: dict, part_index: int, step: int, total: int) -> str
     )
 
 
+READY_KEYBOARD = InlineKeyboardMarkup(
+    [[
+        InlineKeyboardButton("✅ Да", callback_data="ready_yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="ready_no"),
+    ]]
+)
+
+
+def build_readiness_text(song_title: str, group_title: str) -> str:
+    minutes = READINESS_CHECK_SECONDS // 60
+    return (
+        f"\U0001F3A4 Скоро в группе «{html.escape(group_title)}» начнётся исполнение песни "
+        f"«<b>{html.escape(song_title)}</b>».\n\n"
+        f"Готовы принять в ней участие? Если не ответите в течение {minutes} минут, "
+        "будем считать, что нет, и партии распределят без вас."
+    )
+
+
 CONFIRM_BUTTON = InlineKeyboardMarkup(
     [[InlineKeyboardButton("\u2705 Подтвердить и продолжить", callback_data="confirm_take")]]
 )
@@ -644,7 +698,7 @@ async def send_next_prompt(context: ContextTypes.DEFAULT_TYPE, participant_id: i
 
 
 async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_round
+    global current_readiness_check
 
     if update.effective_chat.type not in ("group", "supergroup"):
         await call_with_retry(
@@ -669,6 +723,16 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if current_readiness_check is not None and current_readiness_check.active:
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Идёт опрос готовности участников для предыдущего запуска /playsong. "
+                "Дождитесь его завершения (или отмените его через /cancel)."
+            ),
+            description="playsong: readiness poll already in progress reply",
+        )
+        return
+
     group_registrations = registered_users.get(update.effective_chat.id, {})
     if not group_registrations:
         await call_with_retry(
@@ -681,8 +745,8 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    participant_ids = active_participant_ids(chat_id)
-    if not participant_ids:
+    candidate_ids = active_participant_ids(chat_id)
+    if not candidate_ids:
         await call_with_retry(
             lambda: update.message.reply_text(
                 "Все зарегистрированные участники этой группы сейчас в snooze. "
@@ -700,9 +764,60 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Song rotation for chat %s exhausted; resetting.", chat_id)
     played_songs.setdefault(chat_id, set()).add(filename)
 
+    rc = ReadinessCheck(song, filename, chat_id, candidate_ids)
+    current_readiness_check = rc
+
+    minutes = READINESS_CHECK_SECONDS // 60
+    await call_with_retry(
+        lambda: update.message.reply_text(
+            f"\U0001F4E9 Спрашиваем участников, готовы ли они исполнить «{song['title']}»\u2026 "
+            f"Ответ ожидается в течение {minutes} минут."
+        ),
+        description="playsong: readiness poll start reply",
+    )
+
+    readiness_text = build_readiness_text(song["title"], update.effective_chat.title)
+    for pid in candidate_ids:
+        try:
+            await call_with_retry(
+                lambda pid=pid: context.bot.send_message(
+                    chat_id=pid,
+                    text=readiness_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=READY_KEYBOARD,
+                ),
+                description=f"readiness poll DM to {pid}",
+            )
+        except Exception as e:
+            # Same reasoning as the DM loop in start_round -- e.g. Forbidden if this
+            # person blocked the bot. They just won't be able to answer, so they'll
+            # be treated as "no response" once the poll resolves.
+            logger.warning("Could not send readiness DM to %s: %s", pid, e)
+
+    # The check is already created above, so even if every DM above failed, the
+    # timer scheduled here must still run -- otherwise it would be stuck "active"
+    # forever, permanently blocking any further /playsong in this chat.
+    rc.job = context.job_queue.run_once(
+        resolve_readiness_check, READINESS_CHECK_SECONDS, name="resolve_readiness"
+    )
+
+
+async def start_round(
+    context: ContextTypes.DEFAULT_TYPE,
+    song: dict,
+    filename: str,
+    chat_id: int,
+    participant_ids: list[int],
+) -> None:
+    """Creates and kicks off the actual Round: assigns parts round-robin among
+    `participant_ids` (those who confirmed readiness), announces it in the
+    group, DMs each participant their part(s), and schedules finalize_round.
+    """
+    global current_round
+
     assignments = assign_parts(song, participant_ids)
 
-    r = Round(song, filename, update.effective_chat.id, participant_ids)
+    r = Round(song, filename, chat_id, participant_ids)
     r.assignments = assignments
     r.current_pointer = {pid: 0 for pid in participant_ids}
     r.perk = maybe_pick_perk()
@@ -719,8 +834,8 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if r.perk:
         announcement += f"\n\n\U0001F3B2 Модификатор: <b>{r.perk}</b>"
     await call_with_retry(
-        lambda: update.message.reply_text(announcement, parse_mode=ParseMode.HTML),
-        description="playsong: round start announcement",
+        lambda: context.bot.send_message(chat_id=chat_id, text=announcement, parse_mode=ParseMode.HTML),
+        description="start_round: round start announcement",
     )
 
     for pid in participant_ids:
@@ -743,6 +858,67 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Could not DM participant %s: %s", pid, e)
 
     r.job = context.job_queue.run_once(finalize_round, ROUND_DURATION_SECONDS, name="finalize_round")
+
+
+async def resolve_readiness_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called once READINESS_CHECK_SECONDS elapses, or earlier if every
+    candidate has already answered (see readiness_callback). Starts the real
+    round with whoever said "Да"; if nobody did, the round never happens.
+    """
+    global current_readiness_check
+    rc = current_readiness_check
+    if rc is None or not rc.active:
+        return
+    rc.active = False
+    current_readiness_check = None
+
+    ready_ids = [pid for pid in rc.candidate_ids if rc.responses.get(pid) is True]
+
+    if not ready_ids:
+        record_song_history(rc.group_chat_id, rc.song["title"], "no_participants")
+        text = (
+            f"\U0001F614 Никто не подтвердил готовность исполнить «{rc.song['title']}». "
+            "Раунд отменён \u2014 запустите /playsong ещё раз, когда участники будут готовы."
+        )
+        await call_with_retry(
+            lambda: context.bot.send_message(chat_id=rc.group_chat_id, text=text),
+            description="resolve_readiness_check: nobody ready group announcement",
+        )
+        return
+
+    await start_round(context, rc.song, rc.filename, rc.group_chat_id, ready_ids)
+
+
+async def readiness_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rc = current_readiness_check
+    query = update.callback_query
+    user_id = query.from_user.id
+    await answer_callback_query_best_effort(query)
+
+    if rc is None or not rc.active or user_id not in rc.candidate_ids:
+        await call_with_retry(
+            lambda: query.edit_message_text("Этот опрос готовности уже завершён."),
+            description="readiness_callback: expired reply",
+        )
+        return
+
+    is_ready = query.data == "ready_yes"
+    rc.responses[user_id] = is_ready
+
+    if is_ready:
+        ack = f"\u2705 Отлично, вы участвуете в исполнении «{rc.song['title']}»!"
+    else:
+        ack = "Хорошо, в этот раз пропустим. Увидимся в следующий раз!"
+    await call_with_retry(
+        lambda: query.edit_message_text(ack),
+        description="readiness_callback: ack reply",
+    )
+
+    if len(rc.responses) >= len(rc.candidate_ids):
+        # Everyone's answered -- no need to wait out the rest of the timer.
+        if rc.job is not None:
+            rc.job.schedule_removal()
+        await resolve_readiness_check(context)
 
 
 async def video_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -870,26 +1046,35 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Immediately cancels the active round, wherever it's at, and notifies the
-    group plus every participant who had a part assigned. Only an administrator
-    or the creator of the round's group may do this. Can be invoked either from
-    that group directly, or via DM (useful if the group chat itself is
-    unreachable) -- either way, permission is checked against the round's
-    group, not the chat the command was typed in.
+    """Immediately cancels whatever's in progress -- an active round, or the
+    readiness poll that precedes one -- and notifies the group plus every
+    participant who had a part assigned or was asked about readiness. Only an
+    administrator or the creator of the relevant group may do this. Can be
+    invoked either from that group directly, or via DM (useful if the group
+    chat itself is unreachable) -- either way, permission is checked against
+    the round's/poll's group, not the chat the command was typed in.
     """
-    global current_round
+    global current_round, current_readiness_check
     r = current_round
+    rc = current_readiness_check
 
-    if r is None or not r.active:
+    round_active = r is not None and r.active
+    readiness_active = rc is not None and rc.active
+
+    if not round_active and not readiness_active:
         await call_with_retry(
             lambda: update.message.reply_text("Сейчас нет активного раунда для отмены."),
             description="cancel_command: no active round reply",
         )
         return
 
+    # A round is only ever created once its readiness poll has resolved, so
+    # the two are never simultaneously active -- at most one of these is set.
+    group_chat_id = r.group_chat_id if round_active else rc.group_chat_id
+
     chat = update.effective_chat
     user_id = update.effective_user.id
-    called_from_group = chat.type in ("group", "supergroup") and chat.id == r.group_chat_id
+    called_from_group = chat.type in ("group", "supergroup") and chat.id == group_chat_id
     called_from_dm = chat.type == "private"
 
     if not (called_from_group or called_from_dm):
@@ -901,13 +1086,38 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not await is_group_admin(context, r.group_chat_id, user_id):
+    if not await is_group_admin(context, group_chat_id, user_id):
         await call_with_retry(
             lambda: update.message.reply_text(
                 "Отменять исполнение песни могут только администраторы или создатель группы."
             ),
             description="cancel_command: not admin reply",
         )
+        return
+
+    if readiness_active:
+        rc.active = False
+        if rc.job is not None:
+            rc.job.schedule_removal()
+
+        record_song_history(rc.group_chat_id, rc.song["title"], "cancelled")
+
+        text = f"\u274c Опрос готовности для «{rc.song['title']}» отменён администратором."
+        await call_with_retry(
+            lambda: context.bot.send_message(chat_id=rc.group_chat_id, text=text),
+            description="cancel_command: readiness poll group announcement",
+        )
+        for pid in rc.candidate_ids:
+            await call_with_retry(
+                lambda pid=pid: context.bot.send_message(chat_id=pid, text=text),
+                description=f"cancel_command: readiness poll DM to {pid}",
+            )
+
+        logger.info(
+            "Readiness poll for chat %s (song file %s) cancelled by user %s",
+            rc.group_chat_id, rc.filename, user_id,
+        )
+        current_readiness_check = None
         return
 
     r.active = False
@@ -1374,6 +1584,7 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
+    app.add_handler(CallbackQueryHandler(readiness_callback, pattern="^ready_(yes|no)$"))
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting...")
