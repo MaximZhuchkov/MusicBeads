@@ -53,12 +53,14 @@ Song JSON schema (see songs/example_song.json):
   {
     "title": "...",
     "parts": [
-      { "id": "verse1", "label": "Куплет 1", "lines": ["line one", "line two"] },
+      { "lines": ["line one", "line two"] },
       ...
     ]
   }
   Each part's "lines" is a list of strings so a single component can span
-  multiple lines of lyrics.
+  multiple lines of lyrics. Parts are deliberately unlabeled (no verse/chorus
+  distinction) and shown to participants only as numbered "Часть N" -- who's
+  performing verse vs. chorus isn't something they need to know.
 
 Known v1 simplifications (see chat for discussion):
   - No check that a /register'd user is actually a member of the target group
@@ -95,13 +97,14 @@ import os
 import random
 import re
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TelegramError, TimedOut
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -111,6 +114,8 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
+
+from video_concat import VideoConcatError, build_concatenated_video, ffmpeg_available
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -126,8 +131,9 @@ SONGS_DIR = Path(__file__).parent / "songs"
 PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
 ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 900))
-READINESS_CHECK_SECONDS = int(os.environ.get("READINESS_CHECK_SECONDS", 300))
-PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.2))
+READINESS_CHECK_SECONDS = int(os.environ.get("READINESS_CHECK_SECONDS", 60))
+PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.8))
+VIDEO_NOTE_SEND_DELAY_SECONDS = float(os.environ.get("VIDEO_NOTE_SEND_DELAY_SECONDS", 2))
 
 # ---------------------------------------------------------------------------
 # Persistence (SQLite-backed registrations and snoozes)
@@ -162,6 +168,14 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 until_ts INTEGER NOT NULL,
                 PRIMARY KEY (chat_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_settings (
+                chat_id INTEGER PRIMARY KEY,
+                concat_enabled INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -237,6 +251,28 @@ def db_clear_snooze(chat_id: int, user_id: int) -> bool:
         return cur.rowcount > 0
 
 
+def load_concat_settings() -> dict[int, bool]:
+    """Load every group's persisted post-round concatenated-video setting
+    into chat_id -> enabled. A chat_id absent here has never had /concat run
+    and defaults to disabled (see concat_command).
+    """
+    result: dict[int, bool] = {}
+    with sqlite3.connect(DB_FILE) as conn:
+        for chat_id, enabled in conn.execute("SELECT chat_id, concat_enabled FROM group_settings"):
+            result[chat_id] = bool(enabled)
+    return result
+
+
+def db_set_concat_enabled(chat_id: int, enabled: bool) -> None:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO group_settings (chat_id, concat_enabled) VALUES (?, ?) "
+            "ON CONFLICT (chat_id) DO UPDATE SET concat_enabled = excluded.concat_enabled",
+            (chat_id, int(enabled)),
+        )
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
@@ -251,6 +287,11 @@ registered_users: dict[int, dict[int, dict]] = {}
 # table the same way. A snoozed-but-still-registered user is skipped when
 # assigning parts for a round until their snooze expires.
 snoozed_until: dict[int, dict[int, int]] = {}
+
+# chat_id -> whether this group has the post-round concatenated-video feature
+# enabled (admin-toggled via /concat). Mirrors the `group_settings` DB table.
+# Any chat_id absent here defaults to disabled -- see concat_command below.
+concat_enabled: dict[int, bool] = {}
 
 # chat_id -> set of song filenames already picked for that group. Intentionally
 # NOT persisted -- starts empty every time the bot restarts (see module docstring).
@@ -402,23 +443,42 @@ def resolve_registered_user(chat_id: int, ref: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
-async def call_with_retry(coro_factory, description, attempts=3, base_delay=2.0):
+async def call_with_retry(coro_factory, description, attempts=3, base_delay=2.0, max_flood_waits=3):
     """Retry a Telegram API call a few times on transient network errors
     (timeouts, dropped connections -- common on a flaky proxy/VPN path).
     Does NOT retry on permanent errors (bad request, forbidden, etc.) --
     those would just fail the same way every time.
     Returns None (and logs) if every attempt fails, rather than raising, so a
     caller isn't forced to add its own try/except for this specific failure mode.
+
+    RetryAfter (flood control) is handled separately from the network-error
+    retries above: Telegram tells us exactly how long to wait, so we sleep
+    that long and retry without burning one of the normal `attempts` -- it's
+    not a failure, just a rate limit. `max_flood_waits` still bounds it so a
+    persistently flooded chat can't stall the caller forever.
     """
     last_exc = None
-    for attempt in range(1, attempts + 1):
+    flood_waits = 0
+    attempt = 1
+    while attempt <= attempts:
         try:
             return await coro_factory()
+        except RetryAfter as e:
+            flood_waits += 1
+            if flood_waits > max_flood_waits:
+                logger.error("%s hit flood control repeatedly, giving up: %s", description, e)
+                return None
+            wait = e.retry_after + 1
+            logger.warning(
+                "%s hit flood control, waiting %ss before retrying: %s", description, wait, e
+            )
+            await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
             last_exc = e
             logger.warning("%s failed (attempt %s/%s): %s", description, attempt, attempts, e)
-            if attempt < attempts:
-                await asyncio.sleep(base_delay * attempt)
+            attempt += 1
+            if attempt <= attempts:
+                await asyncio.sleep(base_delay * (attempt - 1))
     logger.error("%s failed after %s attempts, giving up: %s", description, attempts, last_exc)
     return None
 
@@ -543,10 +603,11 @@ def build_overview_message(song: dict, assigned_indices: list[int]) -> str:
     blocks = []
     for i, part in enumerate(song["parts"]):
         joined = part_text(part, sep="\n")
+        label = f"Часть {i + 1}"
         if i in assigned_set:
-            blocks.append(f"\U0001F449 <b>{part['label']}:\n{joined}</b>")
+            blocks.append(f"\U0001F449 <b>{label}:\n{joined}</b>")
         else:
-            blocks.append(f"{part['label']}:\n{joined}")
+            blocks.append(f"{label}:\n{joined}")
     return f"<b>{song['title']}</b>\n\n" + BLOCK_SEPARATOR.join(blocks)
 
 
@@ -554,7 +615,7 @@ def build_prompt_text(song: dict, part_index: int, step: int, total: int) -> str
     part = song["parts"][part_index]
     quoted = part_text(part, sep="\n")
     return (
-        f"\U0001F3A5 Запишите часть {step}/{total}: <b>{part['label']}</b>\n"
+        f"\U0001F3A5 Запишите часть {step}/{total}\n"
         f"\u00ab{quoted}\u00bb\n\n"
         f"Пришлите видеокружок с этой частью. Можно перезаписывать сколько угодно "
         f"раз \u2014 засчитывается только последний вариант. Нажмите «Подтвердить», "
@@ -832,7 +893,7 @@ async def start_round(
         f"У вас есть {ROUND_DURATION_SECONDS // 60} минут."
     )
     if r.perk:
-        announcement += f"\n\n\U0001F3B2 Модификатор: <b>{r.perk}</b>"
+        announcement += f"\n\n\U0001F3B2 Задание: <b>{r.perk}</b>"
     await call_with_retry(
         lambda: context.bot.send_message(chat_id=chat_id, text=announcement, parse_mode=ParseMode.HTML),
         description="start_round: round start announcement",
@@ -1010,7 +1071,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r.current_pointer[user_id] += 1
 
     await call_with_retry(
-        lambda: query.edit_message_text(f"\u2705 Зафиксировано: {r.song['parts'][part_index]['label']}"),
+        lambda: query.edit_message_text(f"\u2705 Зафиксировано: часть {part_index + 1}"),
         description="confirm_callback: locked-in reply",
     )
 
@@ -1403,6 +1464,70 @@ async def unregister_user_command(update: Update, context: ContextTypes.DEFAULT_
         )
 
 
+async def concat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only. Turns this group's post-round combined video on or off --
+    when on, finalize_round posts one extra video (all of this song's clips
+    concatenated in song order) after the individual circles, once a round
+    finishes successfully. Off by default for every group until an admin
+    runs this. Usage:
+      /concat on
+      /concat off
+    """
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Запустите /concat в групповом чате."),
+            description="concat_command: wrong chat type reply",
+        )
+        return
+
+    if not await is_group_admin(context, chat.id, update.effective_user.id):
+        await call_with_retry(
+            lambda: update.message.reply_text(
+                "Использовать /concat могут только администраторы или создатель группы."
+            ),
+            description="concat_command: not admin reply",
+        )
+        return
+
+    args = context.args or []
+    if len(args) != 1 or args[0].lower() not in ("on", "off"):
+        await call_with_retry(
+            lambda: update.message.reply_text("Использование: /concat on  или  /concat off"),
+            description="concat_command: usage reply",
+        )
+        return
+
+    enabled = args[0].lower() == "on"
+    chat_id = chat.id
+    concat_enabled[chat_id] = enabled
+    db_set_concat_enabled(chat_id, enabled)
+
+    if enabled:
+        text = (
+            "✅ Склейка общего видео из всех кружков включена. После каждой "
+            "успешно исполненной песни в группу дополнительно придёт одно общее видео."
+        )
+        if not ffmpeg_available():
+            text += (
+                "\n\n⚠️ На сервере бота не найден ffmpeg, поэтому склейка сейчас "
+                "не сработает (ошибка уйдёт только в лог, группу это не потревожит). "
+                "Настройка сохранена и заработает, как только ffmpeg установят."
+            )
+    else:
+        text = "❌ Склейка общего видео выключена. Будут приходить только отдельные кружки."
+
+    await call_with_retry(
+        lambda: update.message.reply_text(text),
+        description="concat_command: confirmation reply",
+    )
+
+    logger.info(
+        "Concatenated-video setting for chat %s set to %s by admin %s",
+        chat_id, enabled, update.effective_user.id,
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Open to everyone (not admin-only) -- a friendly, emoji-led snapshot of
     this group's roster (who's registered, who's snoozed) and every song
@@ -1477,31 +1602,31 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
         record_song_history(r.group_chat_id, r.song["title"], "success")
         intro = f"\U0001F3AC Песня готова: {r.song['title']}"
         if r.perk:
-            intro += f"\n\U0001F3B2 Модификатор: {r.perk}"
+            intro += f"\n\U0001F3B2 Задание: {r.perk}"
         await call_with_retry(
             lambda: context.bot.send_message(chat_id=r.group_chat_id, text=intro),
             description="finalize_round: intro message",
         )
         for part_index in range(r.num_parts()):
             submission = r.submissions[part_index]
-            label = r.song["parts"][part_index]["label"]
-            performer_info = registered_users.get(r.group_chat_id, {}).get(submission["user_id"])
-            performer = performer_info["name"] if performer_info else "участник"
-            await call_with_retry(
-                lambda label=label, performer=performer, part_index=part_index: context.bot.send_message(
-                    chat_id=r.group_chat_id, text=f"Часть {part_index + 1}: {label} \u2014 {performer}"
-                ),
-                description=f"finalize_round: caption for part {part_index}",
-            )
+            if part_index > 0:
+                # Small pacing gap so a long song's back-to-back circles don't
+                # trip Telegram's per-chat flood control (see the RetryAfter
+                # handling in call_with_retry).
+                await asyncio.sleep(VIDEO_NOTE_SEND_DELAY_SECONDS)
             # Keep going even if this one clip ultimately fails to send after
             # retries -- one dropped connection shouldn't cancel the rest of
-            # the performance.
+            # the performance. No caption -- who's performing is obvious from
+            # the person visible in the circle.
             await call_with_retry(
                 lambda submission=submission: context.bot.send_video_note(
                     chat_id=r.group_chat_id, video_note=submission["file_id"]
                 ),
                 description=f"finalize_round: video note for part {part_index}",
             )
+
+        if concat_enabled.get(r.group_chat_id, False):
+            await send_concatenated_video(context, r)
     else:
         record_song_history(r.group_chat_id, r.song["title"], "incomplete")
         missing = r.num_parts() - len(r.submissions)
@@ -1522,6 +1647,44 @@ async def finalize_round(context: ContextTypes.DEFAULT_TYPE):
     current_round = None
 
 
+async def send_concatenated_video(context: ContextTypes.DEFAULT_TYPE, r: Round) -> None:
+    """Best-effort: builds one combined video from this round's clips (song
+    order) and posts it to the group in addition to the individual circles
+    finalize_round already sent above. Never touches the group on failure --
+    only the log -- since the individual clips are the guaranteed
+    deliverable and this is a bonus on top of them.
+    """
+    file_ids = [r.submissions[i]["file_id"] for i in range(r.num_parts())]
+    with tempfile.TemporaryDirectory(prefix="musicbeads_concat_") as tmp_dir:
+        try:
+            combined_path = await build_concatenated_video(context.bot, file_ids, Path(tmp_dir))
+            with open(combined_path, "rb") as f:
+                video_bytes = f.read()
+        except VideoConcatError as e:
+            logger.error(
+                "Video concatenation failed for chat %s (song %s): %s",
+                r.group_chat_id, r.song["title"], e,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "Unexpected error building concatenated video for chat %s (song %s)",
+                r.group_chat_id, r.song["title"],
+            )
+            return
+
+    # video_bytes (not a file handle) so a retry inside call_with_retry re-sends
+    # the same bytes rather than re-reading an already-exhausted file cursor.
+    await call_with_retry(
+        lambda: context.bot.send_video(
+            chat_id=r.group_chat_id,
+            video=video_bytes,
+            caption=f"\U0001F3AC «{r.song['title']}» — общая запись",
+        ),
+        description="finalize_round: combined video upload",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1532,7 +1695,27 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # timeout on a call not wrapped in try/except). Logs it instead of letting it
     # silently vanish; the bot keeps running either way -- PTB isolates exceptions
     # per update.
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        # Transient connectivity blip (e.g. proxy/connection reset during getUpdates
+        # long polling). PTB's polling loop already retries these on its own, so this
+        # isn't a bug -- just note it without the alarming ERROR+traceback noise.
+        logger.warning("Network hiccup while processing update %s: %s", update, context.error)
+        return
     logger.error("Unhandled exception while processing update %s", update, exc_info=context.error)
+
+
+async def announce_startup(app: Application) -> None:
+    """Post-init hook: let every group the bot knows about (i.e. has at least
+    one registration) know the bot process just (re)started, before polling
+    begins. Best-effort per chat -- one chat failing (bot kicked, etc.)
+    shouldn't stop the announcement from reaching the others.
+    """
+    text = "\U0001F3B5 Бот перезапущен и снова на связи!"
+    for chat_id in registered_users:
+        await call_with_retry(
+            lambda chat_id=chat_id: app.bot.send_message(chat_id=chat_id, text=text),
+            description=f"announce_startup: chat {chat_id}",
+        )
 
 
 def main():
@@ -1540,9 +1723,10 @@ def main():
         raise RuntimeError("Set the SONG_BOT_TOKEN environment variable.")
 
     init_db()
-    global registered_users, snoozed_until
+    global registered_users, snoozed_until, concat_enabled
     registered_users = load_registrations()
     snoozed_until = load_snoozes()
+    concat_enabled = load_concat_settings()
     total = sum(len(users) for users in registered_users.values())
     logger.info(
         "Loaded %s registration(s) across %s group(s) from %s",
@@ -1551,6 +1735,14 @@ def main():
     snoozed_total = sum(len(users) for users in snoozed_until.values())
     if snoozed_total:
         logger.info("Loaded %s active snooze(s) across %s group(s)", snoozed_total, len(snoozed_until))
+    concat_total = sum(concat_enabled.values())
+    if concat_total:
+        logger.info("Loaded concatenated-video setting: enabled for %s group(s)", concat_total)
+    if not ffmpeg_available():
+        logger.warning(
+            "ffmpeg not found on PATH -- any group that enables /concat will have its "
+            "combined-video step fail (logged, not shown to the group) until ffmpeg is installed."
+        )
 
     # getUpdates (long polling) holds a connection open for its whole poll interval.
     # If it shared a pool with outgoing calls (sendMessage, sendVideoNote, etc.), those
@@ -1570,6 +1762,7 @@ def main():
         .token(BOT_TOKEN)
         .request(request)
         .get_updates_request(get_updates_request)
+        .post_init(announce_startup)
         .build()
     )
     app.add_handler(CommandHandler("start", start_command))
@@ -1581,6 +1774,7 @@ def main():
     app.add_handler(CommandHandler("unsnooze", unsnooze_command))
     app.add_handler(CommandHandler("unregister_user", unregister_user_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("concat", concat_command))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, video_note_handler))
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
