@@ -11,6 +11,12 @@ Flow:
      whether they're ready to perform it, song name included. Anyone who taps
      "Нет" or doesn't respond within READINESS_CHECK_SECONDS (default 5
      minutes) is excluded from this song -- no part is assigned to them.
+     /playsong <text> instead searches song titles for <text> (case-
+     insensitive, matches performer too since titles are "Performer - Song"):
+     a single match starts that song directly, no matches says so, and
+     multiple matches shows up to 5 as buttons (any group admin may tap one;
+     re-running /playsong, with or without a query, discards an unanswered
+     prompt rather than blocking on it).
   3. Once every candidate has answered (or the 5 minutes are up, whichever
      comes first), the bot round-robin assigns parts among whoever said "Да"
      and DMs each their part(s). If nobody said "Да", the round is cancelled
@@ -42,6 +48,14 @@ registrants who'd otherwise leave a song perpetually incomplete:
 snapshot: who's registered, who's currently snoozed (and until when), and the
 outcome of every song played since the bot last started (✅ success,
 ❌ timed out incomplete, 🚫 cancelled by an admin).
+
+New songs: dropping a plain-text file into unparsed_songs/ is enough -- every
+NEW_SONGS_CHECK_SECONDS (default 5 minutes, also checked shortly after
+startup) the bot runs parse_songs.parse_unparsed_songs() to convert any
+waiting files into songs/ and announces the resulting titles, in one message
+per batch, to every group it knows about. Parsing deletes each source file as
+it's converted, so a song is announced exactly once, however many checks run
+afterward.
 
 Song selection avoids repeats: each group won't be given the same song twice in
 a row across separate /playsong runs until every song in songs/ has come up for
@@ -115,6 +129,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+import parse_songs
 from video_concat import VideoConcatError, build_concatenated_video, ffmpeg_available
 
 logging.basicConfig(
@@ -132,6 +147,7 @@ PERKS_FILE = Path(__file__).parent / "perks"
 DB_FILE = Path(os.environ.get("SONG_BOT_DB", str(Path(__file__).parent / "registrations.db")))
 ROUND_DURATION_SECONDS = int(os.environ.get("ROUND_DURATION_SECONDS", 900))
 READINESS_CHECK_SECONDS = int(os.environ.get("READINESS_CHECK_SECONDS", 60))
+NEW_SONGS_CHECK_SECONDS = int(os.environ.get("NEW_SONGS_CHECK_SECONDS", 300))
 PERK_PROBABILITY = float(os.environ.get("PERK_PROBABILITY", 0.8))
 VIDEO_NOTE_SEND_DELAY_SECONDS = float(os.environ.get("VIDEO_NOTE_SEND_DELAY_SECONDS", 2))
 
@@ -372,6 +388,31 @@ class ReadinessCheck:
 current_readiness_check: Optional[ReadinessCheck] = None
 
 
+class SongSelection:
+    """Holds a pending "which song did you mean" prompt from /playsong <query>
+    when the query matched more than one song -- the group chat is shown up to
+    5 titles as buttons and any group admin can tap one to start it.
+
+    `token` disambiguates stale button taps: if /playsong is re-run (with or
+    without a new query) while a selection is still unanswered, it's simply
+    replaced -- no timeout needed -- but a tap on the old message's buttons
+    must not be misread as picking from the new list. Each SongSelection gets
+    the next value from _song_selection_counter, embedded in callback_data
+    alongside the picked index, so a tap is honored only if its token still
+    matches current_song_selection.
+    """
+
+    def __init__(self, token: int, group_chat_id: int, query: str, matches: list[tuple[Path, str]]):
+        self.token = token
+        self.group_chat_id = group_chat_id
+        self.query = query
+        self.matches = matches  # [(path, title), ...], already truncated to the displayed buttons
+
+
+current_song_selection: Optional[SongSelection] = None
+_song_selection_counter = 0
+
+
 def is_snoozed(chat_id: int, user_id: int) -> bool:
     """Whether the user is currently snoozed in this group. Lazily cleans up
     expired snoozes (memory + DB) as a side effect, so callers don't need to
@@ -525,6 +566,11 @@ async def is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
 # ---------------------------------------------------------------------------
 
 
+def load_song_file(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_random_song(exclude: Optional[set[str]] = None) -> tuple[dict, str, bool]:
     """Pick a random song file, skipping any filename in `exclude`.
 
@@ -544,9 +590,21 @@ def load_random_song(exclude: Optional[set[str]] = None) -> tuple[dict, str, boo
     if exhausted:
         available = files
     path = random.choice(available)
-    with open(path, "r", encoding="utf-8") as f:
-        song = json.load(f)
-    return song, path.name, exhausted
+    return load_song_file(path), path.name, exhausted
+
+
+def search_songs(query: str) -> list[tuple[Path, str]]:
+    """Every song whose title contains `query` (case-insensitive), sorted by
+    title. Titles are "Performer - Song", so this matches on performer too.
+    """
+    needle = query.casefold()
+    matches = []
+    for path in SONGS_DIR.glob("*.json"):
+        title = load_song_file(path)["title"]
+        if needle in title.casefold():
+            matches.append((path, title))
+    matches.sort(key=lambda m: m[1].casefold())
+    return matches
 
 
 def maybe_pick_perk(probability: float = PERK_PROBABILITY) -> Optional[str]:
@@ -758,8 +816,86 @@ async def send_next_prompt(context: ContextTypes.DEFAULT_TYPE, participant_id: i
     )
 
 
-async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+MAX_SEARCH_RESULTS_SHOWN = 5
+
+
+def build_song_pick_keyboard(token: int, matches: list[tuple[Path, str]]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, (_path, title) in enumerate(matches):
+        label = title if len(title) <= 40 else title[:39] + "…"
+        rows.append([InlineKeyboardButton(f"{i + 1}. {label}", callback_data=f"playsong_pick:{token}:{i}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_song_pick_text(query: str, total_matches: int, matches: list[tuple[Path, str]]) -> str:
+    lines = [f"\U0001F50D По запросу «{query}» найдено песен: {total_matches}."]
+    if total_matches > len(matches):
+        lines[0] += f" Показаны первые {len(matches)}, уточните запрос для остальных."
+    lines.append("")
+    lines.extend(f"{i + 1}. {title}" for i, (_path, title) in enumerate(matches))
+    lines.append("")
+    lines.append("Выберите песню кнопкой ниже или повторите /playsong с более точным запросом.")
+    return "\n".join(lines)
+
+
+async def start_readiness_check(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    chat_title: Optional[str],
+    song: dict,
+    filename: str,
+    candidate_ids: list[int],
+) -> None:
+    """Creates the ReadinessCheck for `song`, announces it in the group, DMs
+    every candidate, and schedules its resolution. Shared by the plain random
+    pick and both search-driven picks (single-match auto-pick, and tapping a
+    button out of multiple matches) in playsong_command / song_pick_callback.
+    """
     global current_readiness_check
+
+    rc = ReadinessCheck(song, filename, chat_id, candidate_ids)
+    current_readiness_check = rc
+
+    minutes = READINESS_CHECK_SECONDS // 60
+    await call_with_retry(
+        lambda: context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"\U0001F4E9 Спрашиваем участников, готовы ли они исполнить «{song['title']}»… "
+                f"Ответ ожидается в течение {minutes} минут."
+            ),
+        ),
+        description="playsong: readiness poll start announcement",
+    )
+
+    readiness_text = build_readiness_text(song["title"], chat_title)
+    for pid in candidate_ids:
+        try:
+            await call_with_retry(
+                lambda pid=pid: context.bot.send_message(
+                    chat_id=pid,
+                    text=readiness_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=READY_KEYBOARD,
+                ),
+                description=f"readiness poll DM to {pid}",
+            )
+        except Exception as e:
+            # Same reasoning as the DM loop in start_round -- e.g. Forbidden if this
+            # person blocked the bot. They just won't be able to answer, so they'll
+            # be treated as "no response" once the poll resolves.
+            logger.warning("Could not send readiness DM to %s: %s", pid, e)
+
+    # The check is already created above, so even if every DM above failed, the
+    # timer scheduled here must still run -- otherwise it would be stuck "active"
+    # forever, permanently blocking any further /playsong in this chat.
+    rc.job = context.job_queue.run_once(
+        resolve_readiness_check, READINESS_CHECK_SECONDS, name="resolve_readiness"
+    )
+
+
+async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_song_selection, _song_selection_counter
 
     if update.effective_chat.type not in ("group", "supergroup"):
         await call_with_retry(
@@ -817,49 +953,51 @@ async def playsong_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    song, filename, exhausted = load_random_song(exclude=played_songs.get(chat_id))
-    if exhausted:
-        # Every song has already been played for this group -- start a fresh
-        # rotation rather than refusing to play.
-        played_songs[chat_id] = set()
-        logger.info("Song rotation for chat %s exhausted; resetting.", chat_id)
-    played_songs.setdefault(chat_id, set()).add(filename)
+    # Re-running /playsong -- with or without a query -- always supersedes any
+    # selection prompt still waiting on a tap; a stale one is simply discarded.
+    current_song_selection = None
 
-    rc = ReadinessCheck(song, filename, chat_id, candidate_ids)
-    current_readiness_check = rc
+    query = " ".join(context.args).strip() if context.args else ""
 
-    minutes = READINESS_CHECK_SECONDS // 60
+    if not query:
+        song, filename, exhausted = load_random_song(exclude=played_songs.get(chat_id))
+        if exhausted:
+            # Every song has already been played for this group -- start a fresh
+            # rotation rather than refusing to play.
+            played_songs[chat_id] = set()
+            logger.info("Song rotation for chat %s exhausted; resetting.", chat_id)
+        played_songs.setdefault(chat_id, set()).add(filename)
+        await start_readiness_check(
+            context, chat_id, update.effective_chat.title, song, filename, candidate_ids
+        )
+        return
+
+    matches = search_songs(query)
+    if not matches:
+        await call_with_retry(
+            lambda: update.message.reply_text(f"По запросу «{query}» ничего не найдено."),
+            description="playsong: no search matches reply",
+        )
+        return
+
+    if len(matches) == 1:
+        path, _title = matches[0]
+        song = load_song_file(path)
+        played_songs.setdefault(chat_id, set()).add(path.name)
+        await start_readiness_check(
+            context, chat_id, update.effective_chat.title, song, path.name, candidate_ids
+        )
+        return
+
+    shown = matches[:MAX_SEARCH_RESULTS_SHOWN]
+    _song_selection_counter += 1
+    current_song_selection = SongSelection(_song_selection_counter, chat_id, query, shown)
     await call_with_retry(
         lambda: update.message.reply_text(
-            f"\U0001F4E9 Спрашиваем участников, готовы ли они исполнить «{song['title']}»\u2026 "
-            f"Ответ ожидается в течение {minutes} минут."
+            build_song_pick_text(query, len(matches), shown),
+            reply_markup=build_song_pick_keyboard(_song_selection_counter, shown),
         ),
-        description="playsong: readiness poll start reply",
-    )
-
-    readiness_text = build_readiness_text(song["title"], update.effective_chat.title)
-    for pid in candidate_ids:
-        try:
-            await call_with_retry(
-                lambda pid=pid: context.bot.send_message(
-                    chat_id=pid,
-                    text=readiness_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=READY_KEYBOARD,
-                ),
-                description=f"readiness poll DM to {pid}",
-            )
-        except Exception as e:
-            # Same reasoning as the DM loop in start_round -- e.g. Forbidden if this
-            # person blocked the bot. They just won't be able to answer, so they'll
-            # be treated as "no response" once the poll resolves.
-            logger.warning("Could not send readiness DM to %s: %s", pid, e)
-
-    # The check is already created above, so even if every DM above failed, the
-    # timer scheduled here must still run -- otherwise it would be stuck "active"
-    # forever, permanently blocking any further /playsong in this chat.
-    rc.job = context.job_queue.run_once(
-        resolve_readiness_check, READINESS_CHECK_SECONDS, name="resolve_readiness"
+        description="playsong: search results reply",
     )
 
 
@@ -980,6 +1118,85 @@ async def readiness_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if rc.job is not None:
             rc.job.schedule_removal()
         await resolve_readiness_check(context)
+
+
+async def song_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles a tap on one of the up-to-5 buttons /playsong <query> shows
+    when the query matched more than one song. Any group admin may tap (not
+    just whoever ran the command); a tap on a superseded selection (a newer
+    /playsong was run since) is rejected via its embedded token.
+    """
+    global current_song_selection
+
+    query = update.callback_query
+    user_id = query.from_user.id
+    selection = current_song_selection
+
+    _, token_str, index_str = query.data.split(":")
+    token, index = int(token_str), int(index_str)
+
+    if selection is None or token != selection.token or not (0 <= index < len(selection.matches)):
+        await answer_callback_query_best_effort(query)
+        await call_with_retry(
+            lambda: query.edit_message_text("Этот выбор устарел — запустите /playsong заново."),
+            description="song_pick_callback: stale selection reply",
+        )
+        return
+
+    chat_id = selection.group_chat_id
+
+    if not await is_group_admin(context, chat_id, user_id):
+        try:
+            await query.answer(
+                "Выбирать песню могут только администраторы группы.", show_alert=True
+            )
+        except TelegramError as e:
+            logger.warning("song_pick_callback: permission alert failed: %s", e)
+        return
+
+    await answer_callback_query_best_effort(query)
+
+    if current_round is not None and current_round.active:
+        current_song_selection = None
+        await call_with_retry(
+            lambda: query.edit_message_text("Раунд уже идёт — этот выбор больше не актуален."),
+            description="song_pick_callback: round already active reply",
+        )
+        return
+
+    if current_readiness_check is not None and current_readiness_check.active:
+        current_song_selection = None
+        await call_with_retry(
+            lambda: query.edit_message_text(
+                "Уже идёт опрос готовности для другой песни — этот выбор больше не актуален."
+            ),
+            description="song_pick_callback: readiness already active reply",
+        )
+        return
+
+    candidate_ids = active_participant_ids(chat_id)
+    if not candidate_ids:
+        current_song_selection = None
+        await call_with_retry(
+            lambda: query.edit_message_text(
+                "Все зарегистрированные участники этой группы сейчас в snooze."
+            ),
+            description="song_pick_callback: all snoozed reply",
+        )
+        return
+
+    path, title = selection.matches[index]
+    song = load_song_file(path)
+    played_songs.setdefault(chat_id, set()).add(path.name)
+    current_song_selection = None
+
+    await call_with_retry(
+        lambda: query.edit_message_text(f"✅ Выбрано: «{title}»"),
+        description="song_pick_callback: picked ack",
+    )
+    await start_readiness_check(
+        context, chat_id, query.message.chat.title, song, path.name, candidate_ids
+    )
 
 
 async def video_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1718,6 +1935,33 @@ async def announce_startup(app: Application) -> None:
         )
 
 
+async def check_new_songs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parses any files waiting in unparsed_songs/ into songs/ (via
+    parse_songs.parse_unparsed_songs) and, if any were added, announces their
+    titles -- as one message per batch, not one per song -- to every group the
+    bot knows about (same best-effort per-chat loop as announce_startup).
+    Parsing removes each source file as it's converted, so a song already
+    picked up on a previous run/check is never parsed -- and therefore never
+    announced -- again. Runs on a JobQueue timer (see main()), including once
+    shortly after startup.
+    """
+    titles = await asyncio.to_thread(parse_songs.parse_unparsed_songs)
+    if not titles:
+        return
+
+    lines = ["\U0001F3B6 В библиотеку добавлены новые песни:"]
+    lines.extend(f"• {title}" for title in titles)
+    text = "\n".join(lines)
+
+    for chat_id in registered_users:
+        await call_with_retry(
+            lambda chat_id=chat_id: context.bot.send_message(chat_id=chat_id, text=text),
+            description=f"check_new_songs: announcement to chat {chat_id}",
+        )
+
+    logger.info("Announced %s new song(s) to %s group(s)", len(titles), len(registered_users))
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Set the SONG_BOT_TOKEN environment variable.")
@@ -1779,7 +2023,12 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO, wrong_video_type_handler))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_take$"))
     app.add_handler(CallbackQueryHandler(readiness_callback, pattern="^ready_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(song_pick_callback, pattern=r"^playsong_pick:\d+:\d+$"))
     app.add_error_handler(error_handler)
+
+    app.job_queue.run_repeating(
+        check_new_songs, interval=NEW_SONGS_CHECK_SECONDS, first=10, name="check_new_songs"
+    )
 
     logger.info("Bot starting...")
     app.run_polling()

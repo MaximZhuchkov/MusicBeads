@@ -60,8 +60,18 @@ def parse_song(text: str) -> dict:
     return {"title": title, "parts": [{"lines": p} for p in parts]}
 
 
-def main():
+def parse_unparsed_songs() -> list[str]:
+    """Parses every file in unparsed_songs/ into songs/, deleting each source
+    file once it's been converted. Returns the titles of the songs that were
+    successfully parsed this call -- since a source file is removed as soon as
+    it's parsed, a given song is only ever reported once across calls (e.g. by
+    a caller that polls this periodically).
+    """
     SONGS_DIR.mkdir(exist_ok=True)
+    if not UNPARSED_DIR.exists():
+        return []
+
+    titles = []
     for src in sorted(UNPARSED_DIR.iterdir()):
         if not src.is_file():
             continue
@@ -77,6 +87,13 @@ def main():
             f.write("\n")
         src.unlink()
         print(f"{src.name} -> {dest.relative_to(Path(__file__).parent)}")
+        titles.append(song["title"])
+
+    return titles
+
+
+def main():
+    parse_unparsed_songs()
 
 
 if __name__ == "__main__":
